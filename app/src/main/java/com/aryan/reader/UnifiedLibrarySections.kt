@@ -287,7 +287,7 @@ internal fun UnifiedLibraryHome(
         },
         shelfView = shelfView,
         onShelfViewChange = onShelfViewChange,
-        shelfContent = { shelfBooks ->
+        shelfContent = { shelfBooks, shelfControls ->
             BookshelfLibraryView(
                 books = shelfBooks,
                 selectedBookIds = selectedBookIds,
@@ -295,6 +295,8 @@ internal fun UnifiedLibraryHome(
                 usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
                 onBookClick = onBookClick,
                 onBookLongClick = onBookLongClick,
+                title = stringResource(R.string.bookshelf_title),
+                controls = shelfControls,
             )
         },
         openTabsContent = {
@@ -423,6 +425,26 @@ internal fun UnifiedShelvesSection(
                 onLongClick = { onBookLongClick(item) },
                 isDownloading = item.bookId in downloadingBookIds,
                 usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
+            )
+        },
+        // 3D wooden bookcases: every shelf previews its books, and an open shelf is a full bookcase.
+        shelfCard = { shelf, onOpen ->
+            BookshelfShelfCard(
+                name = shelf.name,
+                countLabel = unifiedShelfCountLabel(shelf),
+                books = shelf.directBooks,
+                usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
+                onClick = onOpen,
+            )
+        },
+        selectedContent = { _, shelfBooks ->
+            BookshelfLibraryView(
+                books = shelfBooks,
+                selectedBookIds = selectedBookIds,
+                downloadingBookIds = downloadingBookIds,
+                usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
+                onBookClick = onBookClick,
+                onBookLongClick = onBookLongClick,
             )
         },
     )

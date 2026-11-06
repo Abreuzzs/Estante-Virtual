@@ -2690,6 +2690,7 @@
     <string name="media_overlay_chapter_unavailable">This chapter has no narration</string>
 
     <!-- 3D bookshelf view -->
+    <string name="bookshelf_title">My books</string>
     <string name="bookshelf_view">Bookshelf view</string>
     <string name="bookshelf_customize">Customize bookshelf</string>
     <string name="bookshelf_organize">Organize books</string>
@@ -2712,8 +2713,8 @@
     <string name="bookshelf_finish_oak">Oak</string>
     <string name="bookshelf_finish_ebony">Ebony</string>
     <string name="bookshelf_finish_white">White</string>
-    <string name="bookshelf_wall">Wall</string>
-    <string name="bookshelf_wall_auto">Match theme</string>
+    <string name="bookshelf_wall">Back panel</string>
+    <string name="bookshelf_wall_auto">Wood</string>
     <string name="bookshelf_wall_cream">Cream</string>
     <string name="bookshelf_wall_sand">Sand</string>
     <string name="bookshelf_wall_slate">Slate</string>

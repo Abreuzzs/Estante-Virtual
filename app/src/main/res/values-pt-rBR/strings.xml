@@ -1907,6 +1907,7 @@
     <string name="content_desc_align_right">Alinhar à direita</string>
 
     <!-- Estante 3D -->
+    <string name="bookshelf_title">Meus livros</string>
     <string name="bookshelf_view">Visualização em estante</string>
     <string name="bookshelf_customize">Personalizar estante</string>
     <string name="bookshelf_organize">Organizar livros</string>
@@ -1929,8 +1930,8 @@
     <string name="bookshelf_finish_oak">Carvalho</string>
     <string name="bookshelf_finish_ebony">Ébano</string>
     <string name="bookshelf_finish_white">Branco</string>
-    <string name="bookshelf_wall">Parede</string>
-    <string name="bookshelf_wall_auto">Seguir o tema</string>
+    <string name="bookshelf_wall">Fundo</string>
+    <string name="bookshelf_wall_auto">Madeira</string>
     <string name="bookshelf_wall_cream">Creme</string>
     <string name="bookshelf_wall_sand">Areia</string>
     <string name="bookshelf_wall_slate">Ardósia</string>

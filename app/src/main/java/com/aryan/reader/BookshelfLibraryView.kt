@@ -8,10 +8,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -68,8 +70,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
@@ -91,7 +93,8 @@ import androidx.compose.ui.zIndex
 import com.aryan.reader.data.RecentFileItem
 import kotlin.math.abs
 
-private val ShelfSidePadding = 14.dp
+private val CabinetFrame = 10.dp
+private val CabinetPad = 8.dp
 private val SlotGap = 3.dp
 private val PlankTopDepth = 6.dp
 private val PlankFrontHeight = 8.dp
@@ -99,30 +102,59 @@ private val PlankShadowHeight = 12.dp
 private val MaxSideDepth = 4.dp
 
 private data class ShelfPalette(
-    val wallTop: Color,
-    val wallBottom: Color,
+    val back: Color,
     val ink: Color,
+    val frameLight: Color,
+    val frame: Color,
+    val frameDark: Color,
     val plankFar: Color,
     val plankNear: Color,
     val plankFrontTop: Color,
     val plankFrontBottom: Color,
 )
 
-private fun shelfPalette(wall: BookshelfWall, finish: BookshelfFinish, systemDark: Boolean): ShelfPalette {
-    val resolvedWall = if (wall == BookshelfWall.AUTO) {
-        if (systemDark) BookshelfWall.SLATE else BookshelfWall.CREAM
-    } else wall
-    val (wallTop, wallBottom) = when (resolvedWall) {
-        BookshelfWall.SAND -> Color(0xFFE9DCC2) to Color(0xFFD9C8A7)
-        BookshelfWall.SLATE -> Color(0xFF2E333B) to Color(0xFF1F2328)
-        else -> Color(0xFFF3EBDC) to Color(0xFFE6DAC3)
+/** Wood tones for one finish: frame (light/mid/dark), default back panel and the plank faces. */
+private fun shelfPalette(wall: BookshelfWall, finish: BookshelfFinish): ShelfPalette {
+    fun make(
+        frameLight: Long, frame: Long, frameDark: Long, back: Long,
+        plankFar: Long, plankNear: Long, plankFrontTop: Long, plankFrontBottom: Long,
+    ): ShelfPalette {
+        val backColor = when (wall) {
+            BookshelfWall.CREAM -> Color(0xFFEADFC8)
+            BookshelfWall.SAND -> Color(0xFFD7C6A4)
+            BookshelfWall.SLATE -> Color(0xFF2B3037)
+            BookshelfWall.AUTO -> Color(back)
+        }
+        val ink = if (backColor.luminance() > 0.5f) Color(0xFF3B3125) else Color(0xFFF1E6D3)
+        return ShelfPalette(
+            back = backColor,
+            ink = ink,
+            frameLight = Color(frameLight),
+            frame = Color(frame),
+            frameDark = Color(frameDark),
+            plankFar = Color(plankFar),
+            plankNear = Color(plankNear),
+            plankFrontTop = Color(plankFrontTop),
+            plankFrontBottom = Color(plankFrontBottom),
+        )
     }
-    val ink = if (wallTop.luminance() > 0.5f) Color(0xFF3B3125) else Color(0xFFE9E2D3)
     return when (finish) {
-        BookshelfFinish.WALNUT -> ShelfPalette(wallTop, wallBottom, ink, Color(0xFF8A6244), Color(0xFF6B4A32), Color(0xFF59391F), Color(0xFF3E2814))
-        BookshelfFinish.OAK -> ShelfPalette(wallTop, wallBottom, ink, Color(0xFFD7B48C), Color(0xFFBE9768), Color(0xFFA97F52), Color(0xFF8C6740))
-        BookshelfFinish.EBONY -> ShelfPalette(wallTop, wallBottom, ink, Color(0xFF4A4440), Color(0xFF332E2B), Color(0xFF2A2522), Color(0xFF171412))
-        BookshelfFinish.WHITE -> ShelfPalette(wallTop, wallBottom, ink, Color(0xFFFAF7F2), Color(0xFFE9E3D9), Color(0xFFE0DACF), Color(0xFFC9C2B5))
+        BookshelfFinish.WALNUT -> make(
+            0xFF9A6A3E, 0xFF7A5230, 0xFF55361F, 0xFF4B3020,
+            0xFF8A6244, 0xFF6B4A32, 0xFF59391F, 0xFF3E2814,
+        )
+        BookshelfFinish.OAK -> make(
+            0xFFD9B78A, 0xFFC49A66, 0xFFA17A4C, 0xFF8F6B43,
+            0xFFD7B48C, 0xFFBE9768, 0xFFA97F52, 0xFF8C6740,
+        )
+        BookshelfFinish.EBONY -> make(
+            0xFF5A524D, 0xFF3A3431, 0xFF211C1A, 0xFF241F1D,
+            0xFF4A4440, 0xFF332E2B, 0xFF2A2522, 0xFF171412,
+        )
+        BookshelfFinish.WHITE -> make(
+            0xFFFFFFFF, 0xFFEFE9DF, 0xFFD3CBBC, 0xFFE2DACB,
+            0xFFFAF7F2, 0xFFE9E3D9, 0xFFE0DACF, 0xFFC9C2B5,
+        )
     }
 }
 
@@ -155,12 +187,18 @@ private fun spineColor(tintKey: String, bookId: String): Color {
 private data class PackedGroup(val group: BookshelfGroup, val rows: List<List<ShelfSlot>>)
 
 /**
- * 3D-looking bookshelf over the unified library.
+ * 3D-looking wooden bookcase over a list of books.
  *
  * It is a pure presentation of [books] (already filtered and sorted by the host), so books are never
  * duplicated: every action is delegated to the host's existing handlers. Tap opens the book,
  * long-press keeps the library's selection model (add to shelf, tags, delete, ...). The "organize"
  * mode lets people move books freely; only the id order is persisted.
+ *
+ * The cabinet is a lazily composed column of bays, so its height simply follows the number of books
+ * (the page scrolls) and only the visible rows load covers, which keeps RAM low.
+ *
+ * @param title optional heading shown above the cabinet.
+ * @param controls optional host controls (filters, sort...) shown right below the cabinet.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -172,6 +210,8 @@ internal fun BookshelfLibraryView(
     onBookClick: (RecentFileItem) -> Unit,
     onBookLongClick: (RecentFileItem) -> Unit,
     modifier: Modifier = Modifier,
+    title: String? = null,
+    controls: (@Composable () -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val store = remember(context) { BookshelfPreferences(context) }
@@ -181,10 +221,7 @@ internal fun BookshelfLibraryView(
     var pickedId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCustomize by rememberSaveable { mutableStateOf(false) }
 
-    val systemDark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
-    val palette = remember(settings.wall, settings.finish, systemDark) {
-        shelfPalette(settings.wall, settings.finish, systemDark)
-    }
+    val palette = remember(settings.wall, settings.finish) { shelfPalette(settings.wall, settings.finish) }
     val groups = remember(books, settings.grouping, order) {
         buildBookshelfGroups(books, settings.grouping, order.takeIf { it.isNotEmpty() })
     }
@@ -200,14 +237,9 @@ internal fun BookshelfLibraryView(
         pickedId = null
     }
 
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(palette.wallTop, palette.wallBottom)))
-            .testTag("BookshelfLibraryView"),
-    ) {
+    Box(modifier = modifier.fillMaxSize().testTag("BookshelfLibraryView")) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val rowWidth = maxWidth - ShelfSidePadding * 2
+            val rowWidth = maxWidth - CabinetFrame * 2 - CabinetPad * 2
             val metrics = remember(maxWidth) { shelfMetricsFor(maxWidth.value) }
             val packed = remember(groups, rowWidth, metrics, settings.display) {
                 groups.map { group ->
@@ -224,79 +256,98 @@ internal fun BookshelfLibraryView(
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(top = 56.dp, bottom = 112.dp),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 112.dp),
             ) {
+                if (title != null) {
+                    item(key = "title") {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(start = 2.dp, bottom = 12.dp),
+                        )
+                    }
+                }
+                item(key = "cap-top") { CabinetCap(palette = palette, top = true) }
+                item(key = "cap-gap") {
+                    CabinetBay(palette = palette) { Spacer(Modifier.height(4.dp)) }
+                }
                 packed.forEach { packedGroup ->
                     val group = packedGroup.group
                     if (settings.grouping != BookshelfGrouping.NONE) {
                         item(key = "h:${group.id}") {
-                            ShelfGroupHeader(
-                                group = group,
-                                ink = palette.ink,
-                                modifier = Modifier.animateItem(),
-                            )
+                            CabinetBay(palette = palette, modifier = Modifier.animateItem()) {
+                                ShelfGroupHeader(group = group, ink = palette.ink)
+                            }
                         }
                     }
                     itemsIndexed(
                         items = packedGroup.rows,
                         key = { index, _ -> "r:${group.id}:$index" },
                     ) { _, row ->
-                        ShelfRow(
-                            row = row,
-                            rowWidth = rowWidth,
-                            palette = palette,
-                            organizing = organizing,
-                            pickedId = pickedId,
-                            selectedBookIds = selectedBookIds,
-                            downloadingBookIds = downloadingBookIds,
-                            usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
-                            onSlotClick = { item ->
-                                when {
-                                    !organizing -> onBookClick(item)
-                                    pickedId == null -> pickedId = item.bookId
-                                    pickedId == item.bookId -> pickedId = null
-                                    else -> placePicked(item.bookId)
-                                }
-                            },
-                            onSlotLongClick = onBookLongClick,
-                            modifier = Modifier.animateItem(),
-                        )
+                        CabinetBay(palette = palette, modifier = Modifier.animateItem()) {
+                            ShelfRow(
+                                row = row,
+                                rowWidth = rowWidth,
+                                palette = palette,
+                                organizing = organizing,
+                                pickedId = pickedId,
+                                selectedBookIds = selectedBookIds,
+                                downloadingBookIds = downloadingBookIds,
+                                usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
+                                onSlotClick = { item ->
+                                    when {
+                                        !organizing -> onBookClick(item)
+                                        pickedId == null -> pickedId = item.bookId
+                                        pickedId == item.bookId -> pickedId = null
+                                        else -> placePicked(item.bookId)
+                                    }
+                                },
+                                onSlotLongClick = onBookLongClick,
+                            )
+                        }
                     }
                 }
-            }
-        }
-
-        // Floating controls: organize + customize.
-        Row(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            FilledTonalIconButton(
-                onClick = {
-                    organizing = !organizing
-                    pickedId = null
-                },
-                modifier = Modifier.size(40.dp).testTag("BookshelfOrganizeToggle"),
-                colors = if (organizing) {
-                    IconButtonDefaults.filledIconButtonColors()
-                } else {
-                    IconButtonDefaults.filledTonalIconButtonColors()
-                },
-            ) {
-                Icon(
-                    if (organizing) Icons.Default.Check else Icons.Default.SwapHoriz,
-                    contentDescription = stringResource(
-                        if (organizing) R.string.bookshelf_done_organizing else R.string.bookshelf_organize,
-                    ),
-                )
-            }
-            FilledTonalIconButton(
-                onClick = { showCustomize = true },
-                modifier = Modifier.size(40.dp).testTag("BookshelfCustomize"),
-            ) {
-                Icon(Icons.Default.Tune, contentDescription = stringResource(R.string.bookshelf_customize))
+                item(key = "cap-bottom") { CabinetCap(palette = palette, top = false) }
+                if (controls != null) {
+                    item(key = "controls") {
+                        Box(Modifier.padding(top = 16.dp)) { controls() }
+                    }
+                }
+                item(key = "tools") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FilledTonalIconButton(
+                            onClick = {
+                                organizing = !organizing
+                                pickedId = null
+                            },
+                            modifier = Modifier.size(44.dp).testTag("BookshelfOrganizeToggle"),
+                            colors = if (organizing) {
+                                IconButtonDefaults.filledIconButtonColors()
+                            } else {
+                                IconButtonDefaults.filledTonalIconButtonColors()
+                            },
+                        ) {
+                            Icon(
+                                if (organizing) Icons.Default.Check else Icons.Default.SwapHoriz,
+                                contentDescription = stringResource(
+                                    if (organizing) R.string.bookshelf_done_organizing else R.string.bookshelf_organize,
+                                ),
+                            )
+                        }
+                        FilledTonalIconButton(
+                            onClick = { showCustomize = true },
+                            modifier = Modifier.size(44.dp).testTag("BookshelfCustomize"),
+                        ) {
+                            Icon(Icons.Default.Tune, contentDescription = stringResource(R.string.bookshelf_customize))
+                        }
+                    }
+                }
             }
         }
 
@@ -332,6 +383,12 @@ internal fun BookshelfLibraryView(
                             Text(stringResource(R.string.bookshelf_move_to_end))
                         }
                     }
+                    TextButton(onClick = {
+                        organizing = false
+                        pickedId = null
+                    }) {
+                        Text(stringResource(R.string.bookshelf_done_organizing))
+                    }
                 }
             }
         }
@@ -352,6 +409,168 @@ internal fun BookshelfLibraryView(
     }
 }
 
+/**
+ * Card for the "Shelves" screen: a small wooden bookcase previewing the first books of one shelf.
+ * Tapping anywhere (including a book) opens the shelf.
+ */
+@Composable
+internal fun BookshelfShelfCard(
+    name: String,
+    countLabel: String,
+    books: List<RecentFileItem>,
+    usePdfFileNameAsDisplayName: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val store = remember(context) { BookshelfPreferences(context) }
+    val settings = remember(store) { store.loadSettings() }
+    val palette = remember(settings.wall, settings.finish) { shelfPalette(settings.wall, settings.finish) }
+
+    BoxWithConstraints(modifier.fillMaxWidth().clickable(onClick = onClick).testTag("BookshelfShelfCard")) {
+        val rowWidth = maxWidth - CabinetFrame * 2 - CabinetPad * 2
+        val previewRow = remember(books, rowWidth) {
+            val metrics = ShelfMetrics(coverWidth = 56f, coverHeight = 84f)
+            val group = BookshelfGroup("preview", BookshelfGroupKind.ALL, null, books.take(16))
+            packShelfRows(
+                buildShelfSlots(group, BookshelfDisplay.MIXED, metrics),
+                rowWidth.value,
+                SlotGap.value,
+            ).firstOrNull().orEmpty()
+        }
+        Column(Modifier.fillMaxWidth()) {
+            CabinetCap(palette = palette, top = true)
+            CabinetBay(palette = palette) {
+                Column(Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = CabinetPad + 2.dp, end = CabinetPad, top = 10.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = name,
+                            color = palette.ink,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        Text(
+                            text = countLabel,
+                            color = palette.ink.copy(alpha = 0.65f),
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                    if (previewRow.isEmpty()) {
+                        Spacer(Modifier.height(84.dp))
+                        ShelfPlank(palette = palette, modifier = Modifier.offset(y = -(PlankTopDepth / 2)))
+                    } else {
+                        ShelfRow(
+                            row = previewRow,
+                            rowWidth = rowWidth,
+                            palette = palette,
+                            organizing = false,
+                            pickedId = null,
+                            selectedBookIds = emptySet(),
+                            downloadingBookIds = emptySet(),
+                            usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
+                            onSlotClick = { onClick() },
+                            onSlotLongClick = {},
+                        )
+                    }
+                }
+            }
+            CabinetCap(palette = palette, top = false)
+        }
+    }
+}
+
+/** Top or bottom beam of the cabinet. */
+@Composable
+private fun CabinetCap(palette: ShelfPalette, top: Boolean, modifier: Modifier = Modifier) {
+    val shape = if (top) {
+        RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp)
+    } else {
+        RoundedCornerShape(bottomStart = 10.dp, bottomEnd = 10.dp)
+    }
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(16.dp)
+            .clip(shape)
+            .background(
+                Brush.verticalGradient(
+                    if (top) listOf(palette.frameLight, palette.frame) else listOf(palette.frame, palette.frameDark),
+                ),
+            ),
+    )
+}
+
+/**
+ * One horizontal slice of the cabinet: left/right side panels and the back panel are painted behind
+ * [content]. Flat colours (no vertical gradient) keep consecutive lazy items seamless.
+ */
+@Composable
+private fun CabinetBay(
+    palette: ShelfPalette,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .drawBehind {
+                val f = CabinetFrame.toPx()
+                val shade = 14.dp.toPx()
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        listOf(palette.frameLight, palette.frame),
+                        startX = 0f,
+                        endX = f,
+                    ),
+                    size = Size(f, size.height),
+                )
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        listOf(palette.frame, palette.frameDark),
+                        startX = size.width - f,
+                        endX = size.width,
+                    ),
+                    topLeft = Offset(size.width - f, 0f),
+                    size = Size(f, size.height),
+                )
+                drawRect(
+                    color = palette.back,
+                    topLeft = Offset(f, 0f),
+                    size = Size(size.width - 2 * f, size.height),
+                )
+                // Inner side shadows give the back panel depth.
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        listOf(Color.Black.copy(alpha = 0.32f), Color.Transparent),
+                        startX = f,
+                        endX = f + shade,
+                    ),
+                    topLeft = Offset(f, 0f),
+                    size = Size(shade, size.height),
+                )
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        listOf(Color.Transparent, Color.Black.copy(alpha = 0.28f)),
+                        startX = size.width - f - shade,
+                        endX = size.width - f,
+                    ),
+                    topLeft = Offset(size.width - f - shade, 0f),
+                    size = Size(shade, size.height),
+                )
+            }
+            .padding(horizontal = CabinetFrame),
+    ) { content() }
+}
+
 @Composable
 private fun ShelfGroupHeader(group: BookshelfGroup, ink: Color, modifier: Modifier = Modifier) {
     val title = when (group.kind) {
@@ -367,14 +586,14 @@ private fun ShelfGroupHeader(group: BookshelfGroup, ink: Color, modifier: Modifi
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(start = ShelfSidePadding + 2.dp, end = ShelfSidePadding, top = 14.dp, bottom = 8.dp),
+            .padding(start = CabinetPad + 2.dp, end = CabinetPad, top = 10.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
             text = title,
             color = ink,
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -382,8 +601,8 @@ private fun ShelfGroupHeader(group: BookshelfGroup, ink: Color, modifier: Modifi
         )
         Text(
             text = pluralStringResource(R.plurals.book_count, group.books.size, group.books.size),
-            color = ink.copy(alpha = 0.6f),
-            style = MaterialTheme.typography.labelSmall,
+            color = ink.copy(alpha = 0.65f),
+            style = MaterialTheme.typography.labelMedium,
         )
     }
 }
@@ -407,7 +626,7 @@ private fun ShelfRow(
         Row(
             modifier = Modifier
                 .zIndex(1f)
-                .padding(horizontal = ShelfSidePadding)
+                .padding(horizontal = CabinetPad)
                 .height(rowHeight),
             horizontalArrangement = Arrangement.spacedBy(SlotGap),
             verticalAlignment = Alignment.Bottom,
@@ -582,7 +801,7 @@ private fun CoverFace(item: RecentFileItem, slot: ShelfSlot) {
             contentDescription = null,
             contentScale = ContentScale.Crop,
         )
-        // Hinge shading + soft gloss: static gradients, drawn once per frame, no offscreen layers.
+        // Hinge shading + soft gloss: static gradients, no offscreen layers.
         Box(
             Modifier
                 .fillMaxHeight()
@@ -602,16 +821,6 @@ private fun CoverFace(item: RecentFileItem, slot: ShelfSlot) {
                     ),
                 ),
         )
-        val progress = ((item.progressPercentage ?: 0f) / 100f).coerceIn(0f, 1f)
-        if (progress > 0.01f && progress < 1f) {
-            Box(
-                Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth(progress)
-                    .height(3.dp)
-                    .background(MaterialTheme.colorScheme.primary),
-            )
-        }
     }
 }
 
@@ -705,12 +914,11 @@ private fun ShelfPlank(palette: ShelfPalette, modifier: Modifier = Modifier) {
     Canvas(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = (ShelfSidePadding - 6.dp).coerceAtLeast(0.dp))
             .height(totalHeight),
     ) {
         val depth = PlankTopDepth.toPx()
         val front = PlankFrontHeight.toPx()
-        val inset = 6.dp.toPx()
+        val inset = 4.dp.toPx()
         // Top face as a trapezoid: the far edge is narrower, giving real perspective depth.
         val top = Path().apply {
             moveTo(inset, 0f)
@@ -735,15 +943,15 @@ private fun ShelfPlank(palette: ShelfPalette, modifier: Modifier = Modifier) {
             topLeft = Offset(0f, depth),
             size = Size(size.width, 1.dp.toPx()),
         )
-        // Soft shadow cast on the wall below the floating shelf.
+        // Soft shadow cast on the back panel below the plank.
         drawRect(
             brush = Brush.verticalGradient(
-                listOf(Color.Black.copy(alpha = 0.26f), Color.Transparent),
+                listOf(Color.Black.copy(alpha = 0.30f), Color.Transparent),
                 startY = depth + front,
                 endY = depth + front + PlankShadowHeight.toPx(),
             ),
-            topLeft = Offset(inset / 2f, depth + front),
-            size = Size(size.width - inset, PlankShadowHeight.toPx()),
+            topLeft = Offset(0f, depth + front),
+            size = Size(size.width, PlankShadowHeight.toPx()),
         )
     }
 }

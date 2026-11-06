@@ -59,6 +59,10 @@ fun <S, B> SharedAndroidUnifiedShelves(
     emptyShelfLabel: String = noShelvesLabel,
     /** File-manager breadcrumb rendered above the selected shelf content. */
     breadcrumbContent: @Composable () -> Unit = {},
+    /** Optional host renderer for each shelf in the shelf list (receives the open-shelf callback). */
+    shelfCard: (@Composable (S, () -> Unit) -> Unit)? = null,
+    /** Optional host renderer for the books of the open shelf; replaces the grid when there are no child shelves. */
+    selectedContent: (@Composable (S, List<B>) -> Unit)? = null,
 ) {
     if (selectedShelf == null) {
         if (visibleShelves.isEmpty()) {
@@ -72,11 +76,15 @@ fun <S, B> SharedAndroidUnifiedShelves(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(visibleShelves, key = shelfKey) { shelf ->
-                    UnifiedShelfCard(
-                        name = shelfName(shelf),
-                        countLabel = shelfBookCountLabel(shelf),
-                        onClick = { onShelfSelected(shelf) },
-                    )
+                    if (shelfCard != null) {
+                        shelfCard(shelf, { onShelfSelected(shelf) })
+                    } else {
+                        UnifiedShelfCard(
+                            name = shelfName(shelf),
+                            countLabel = shelfBookCountLabel(shelf),
+                            onClick = { onShelfSelected(shelf) },
+                        )
+                    }
                 }
             }
         }
@@ -94,6 +102,8 @@ fun <S, B> SharedAndroidUnifiedShelves(
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(emptyShelfLabel, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+            } else if (selectedContent != null && childShelves.isEmpty()) {
+                Box(Modifier.weight(1f).padding(horizontal = 20.dp)) { selectedContent(selectedShelf, selectedBooks) }
             } else {
                 LazyVerticalGrid(
                     columns = widthClass.bookGridCells(),

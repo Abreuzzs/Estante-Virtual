@@ -71,17 +71,19 @@ fun <T> SharedAndroidUnifiedLibraryHome(
     /** Optional 3D bookshelf presentation. Hosts that pass null keep the grid/list behaviour untouched. */
     shelfView: Boolean = false,
     onShelfViewChange: ((Boolean) -> Unit)? = null,
-    shelfContent: (@Composable (List<T>) -> Unit)? = null,
+    /**
+     * Receives the books plus the host's filter/sort controls row, which the shelf places below the
+     * bookcase. When the shelf is shown the continue-reading card is hidden.
+     */
+    shelfContent: (@Composable (List<T>, @Composable () -> Unit) -> Unit)? = null,
     /** Rendered above the continue-reading card; empty when multi-tab reading is idle. */
     openTabsContent: @Composable () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val gridCells = widthClass.bookGridCells()
-    Column(modifier.fillMaxSize().padding(horizontal = 20.dp)) {
-        openTabsContent()
-        continueReading?.let { continueCard(it, Modifier.padding(top = 16.dp)) }
+    val controls: @Composable () -> Unit = {
         LazyRow(
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
             contentPadding = PaddingValues(horizontal = 2.dp),
@@ -115,31 +117,39 @@ fun <T> SharedAndroidUnifiedLibraryHome(
                 }
             }
         }
-        if (books.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(strings.noBooks, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+    val showShelf = shelfView && shelfContent != null && books.isNotEmpty()
+    Column(modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+        openTabsContent()
+        if (showShelf && shelfContent != null) {
+            Box(Modifier.weight(1f).padding(top = 12.dp)) { shelfContent(books, controls) }
         } else {
-            Surface(
-                Modifier.weight(1f).padding(top = 16.dp),
-                shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                tonalElevation = 1.dp,
-            ) {
-                if (shelfView && shelfContent != null) {
-                    shelfContent(books)
-                } else if (useListView) {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(12.dp, 12.dp, 12.dp, 96.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) { items(books, key = itemKey) { bookListItem(it) } }
-                } else {
-                    LazyVerticalGrid(
-                        columns = gridCells,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(12.dp, 16.dp, 12.dp, 96.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                    ) { items(books, key = itemKey) { bookCard(it) } }
+            continueReading?.let { continueCard(it, Modifier.padding(top = 16.dp)) }
+            Box(Modifier.padding(top = 12.dp)) { controls() }
+            if (books.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(strings.noBooks, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            } else {
+                Surface(
+                    Modifier.weight(1f).padding(top = 16.dp),
+                    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    tonalElevation = 1.dp,
+                ) {
+                    if (useListView) {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(12.dp, 12.dp, 12.dp, 96.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) { items(books, key = itemKey) { bookListItem(it) } }
+                    } else {
+                        LazyVerticalGrid(
+                            columns = gridCells,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(12.dp, 16.dp, 12.dp, 96.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                        ) { items(books, key = itemKey) { bookCard(it) } }
+                    }
                 }
             }
         }
