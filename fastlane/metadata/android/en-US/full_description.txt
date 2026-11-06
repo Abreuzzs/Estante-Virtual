@@ -1,0 +1,13 @@
+<p>Episteme Reader is an offline-first, privacy-focused document and e-book reader that supports PDF, EPUB, MOBI, AZW3, Markdown, HTML, and plain text.</p>
+
+<p><b>Features:</b></p>
+<ul>
+  <li><b>Documents:</b> View PDF, Markdown (MD), TXT, and HTML files.</li>
+  <li><b>E-books:</b> Read EPUB, MOBI, and AZW3 files using native parsing.</li>
+  <li><b>PDF Modes:</b> Vertical Scroll and Paginated views.</li>
+  <li><b>Annotations:</b> Draw directly on pages (ink, highlighter, eraser) or add text notes.</li>
+  <li><b>Customization:</b> Adjust font size, margins, and import custom fonts (.ttf, .otf).</li>
+  <li><b>Organization:</b> Built-in library management and Text-to-Speech (TTS) support.</li>
+</ul>
+
+<p>This is a completely free and open-source (OSS) app built natively using Jetpack Compose.</p>

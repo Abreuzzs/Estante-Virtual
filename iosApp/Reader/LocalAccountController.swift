@@ -1,0 +1,4605 @@
+import AuthenticationServices
+import Combine
+import CryptoKit
+import Foundation
+import os
+import ReaderShared
+import Security
+import UIKit
+
+#if canImport(FirebaseAuth)
+import FirebaseAuth
+#endif
+
+#if canImport(FirebaseCore)
+import FirebaseCore
+#endif
+
+#if canImport(FirebaseFirestore)
+import FirebaseFirestore
+#endif
+
+#if canImport(GoogleSignIn)
+import GoogleSignIn
+#endif
+
+#if canImport(CloudKit)
+import CloudKit
+#endif
+
+/// Native authentication boundary for the shared iOS UI.
+///
+/// Firebase owns the Episteme account. Google Sign-In separately requests
+/// `drive.appdata`, because a Firebase Google credential alone cannot authorize
+/// Google Drive sync.
+enum LocalCloudDataClearResult {
+    case confirmationRequired
+    case authorizationRequired
+    case inProgress
+    case unavailable
+    case cleared(deletedDriveFileCount: Int, localCleanupInvoked: Bool)
+    case failed(String)
+}
+
+@MainActor
+final class LocalAccountController: NSObject, ObservableObject {
+    private enum Provider {
+        static let apple = "APPLE"
+        static let google = "GOOGLE"
+    }
+
+    private static let googleDriveScope = "https://www.googleapis.com/auth/drive.appdata"
+    private static let syncDeviceIDKey = "reader.ios.cloudSyncDeviceId.v1"
+    /// Last Apple-provided profile values seen on this device, per Firebase uid
+    /// (`appleDisplayName.<uid>`) plus the most recent one regardless of uid.
+    /// Apple sends name/email only on the first authorization (and never a
+    /// photo), so these backfill Firebase gaps after re-sign-ins that arrive
+    /// with nil identity. Firebase values always win when present.
+    private static let appleDisplayNameKey = "reader.ios.appleDisplayName.v1"
+    private static let appleEmailKey = "reader.ios.appleEmail.v1"
+    private static let cloudSyncOutboxPullKey = "reader.ios.cloudSyncOutbox.v2.pull"
+    private static let cloudSyncOutboxPushKey = "reader.ios.cloudSyncOutbox.v2.push"
+    private static let cloudShelfObservationsKey = "reader.ios.cloudShelfObservations.v1"
+    private static let cloudFontObservationsKey = "reader.ios.cloudFontObservations.v1"
+    /// Retry backoff mirrors Android's `CloudFolderSyncWorker`
+    /// (`retryDelayMs = (1L shl attempts.coerceIn(0, 8)) * 1_000`): 2s, 4s, 8s …
+    /// capped at 256s with 8 attempts. The previous iOS curve started at 5s,
+    /// doubled to 12 attempts, and capped at 15 minutes, so a handful of
+    /// transient failures parked sync for a quarter of an hour — long enough
+    /// that sync looked broken and hid the underlying error.
+    private static let cloudSyncRetryMaxAttempts: Int = 8
+    private static let cloudSyncRetryMaxDelay: TimeInterval = 256
+    /// Pure-CloudKit library sync (Pro, iOS-only). Drive/Firestore stays
+    /// dormant for later cross-platform work; this flag selects the data
+    /// plane for library sync. Persisted so a debug toggle survives relaunch.
+    private static let cloudKitSyncEnabledKey = "reader.ios.cloudKitLibrarySync.v1.enabled"
+
+    private let syncLogger = Logger(subsystem: "com.aryan.reader", category: "CloudSync")
+    /// Common tag for pure-CloudKit library sync. Filter Console by
+    /// subsystem `com.aryan.reader`, category `CloudKitSync`, or grep the
+    /// `cloudkit_sync.` prefix (also present in exported diagnostics logs).
+    private let cloudKitLogger = Logger(subsystem: "com.aryan.reader", category: "CloudKitSync")
+    /// Sign-out cause log. Every call site of `signOut()`, plus every Firebase
+    /// auth-state transition, reports through here with the same
+    /// `cloudkit_sync.` prefix as the sync pass, so the exported diagnostics
+    /// tell apart user-tap sign-out, remote revocation, account deletion, and
+    /// the "silent" path where Firebase itself drops the session.
+    private func logAccount(_ event: String) {
+        cloudKitLogger.info("cloudkit_sync.\(event, privacy: .public)")
+    }
+    private var lastObservedUid: String?
+    /// Privacy-safe session fingerprint: a stable short hash so the log can
+    /// distinguish "same account" from "different account" without leaking the
+    /// Firebase uid.
+    private static func uidToken(_ uid: String?) -> String {
+        guard let uid, !uid.isEmpty else { return "nil" }
+        return String(sha256(uid).prefix(8))
+    }
+    private let cloudKitTransport = CloudKitLibraryTransport()
+    private var cloudKitSubscriptionEnsured = false
+    /// Pro gate for CloudKit sync. Set from ContentView via StoreKit truth;
+    /// Firebase entitlements remain the source (StoreKit → worker → Firestore
+    /// `users/{uid}`), sync data plane itself needs no login.
+    private var isProForCloudKitSync = false
+    private var cloudSyncRetryTask: Task<Void, Never>?
+    /// In-flight guard for the Drive/Firestore data plane. The CloudKit plane
+    /// tracks pull and push separately (see below).
+    private var cloudSyncInFlight = false
+    /// Pull and push are tracked apart so a reader-close push is not bounced
+    /// into the outbox and made to wait out a retry backoff just because a
+    /// pull happened to be running. Android runs these as separate
+    /// WorkManager jobs, so this is parity, not an optimization.
+    private var cloudKitPullInFlight = false
+    private var cloudKitPushInFlight = false
+    /// Any pass in flight on either data plane. Sign-out, clear-all, and
+    /// account deletion must still wait for all of them, so the destructive
+    /// paths use this rather than any single flag.
+    private var anyCloudSyncInFlight: Bool {
+        cloudSyncInFlight || cloudKitPullInFlight || cloudKitPushInFlight
+    }
+    private var cloudSyncGeneration = 0
+    private var cloudDataClearInFlight = false
+    private var accountDeletionInFlight = false
+    /// Set while the Apple sheet shown for account deletion is outstanding.
+    /// The authorization delegate branches on it (reauth + destroy) instead
+    /// of the normal sign-in/link path.
+    private var pendingAccountDeletion = false
+    private var localCloudDataClearHandler: (() -> Void)?
+
+    private weak var bridge: ReaderIosBridge?
+    private var appleNonce: String?
+    private var googleDriveAuthorized = false
+    private var lastRegisteredDeviceRows: [[String: Any]] = []
+    /// Proactive Firebase ID-token refresh. Android fetches a fresh token per
+    /// API call (`Auth.getIdToken`); iOS consumes the published token
+    /// synchronously, so this re-publishes ahead of the ~1h expiry on the
+    /// shared `AuthTokenRefreshPolicy` schedule.
+    private var authTokenRefreshTask: Task<Void, Never>?
+    private var authTokenFetchedAtMs: Int64 = 0
+
+#if canImport(FirebaseAuth)
+    private var authStateHandle: AuthStateDidChangeListenerHandle?
+#endif
+#if canImport(FirebaseFirestore)
+    private var deviceStatusListener: ListenerRegistration?
+#endif
+
+    private enum CloudSyncOperation: String, Codable, CaseIterable {
+        case pull
+        case push
+    }
+
+    private struct CloudSyncOutboxItem: Codable {
+        let snapshotJSON: String
+        let operation: CloudSyncOperation
+        var attempt: Int
+        var nextAttemptAt: Date
+    }
+
+    private struct CloudShelfObservation: Codable {
+        var name: String
+        var modifiedAt: Int64
+        var bookIDs: [String]
+        var isDeleted: Bool
+    }
+
+    private struct CloudFontObservation: Codable {
+        var displayName: String
+        var fileName: String
+        var fileExtension: String
+        var timestamp: Int64
+        var isDeleted: Bool
+    }
+
+    /// A PDF sidecar is transported as an appDataFolder file, while this
+    /// compact representation is carried through the shared snapshot merge
+    /// boundary.  The timestamp is the Drive modified time when available;
+    /// the payload also carries its own reader-state clock for conflict
+    /// resolution.
+    private struct CloudPdfSidecar {
+        let bookId: String
+        let timestamp: Int64
+        let data: String
+    }
+
+    private struct DownloadedCloudPdfSidecar {
+        let bookId: String
+        let timestamp: Int64
+        let bytes: Int
+        let data: String
+    }
+
+    func attach(to bridge: ReaderIosBridge) {
+        guard self.bridge !== bridge else { return }
+        detachAuthObserver()
+        self.bridge = bridge
+        bridge.setAuthHandlers(
+            authenticate: { [weak self] provider in
+                Task { @MainActor in await self?.authenticate(provider: provider) }
+            },
+            signOut: { [weak self] in
+                self?.logAccount("signout_requested source=user_action")
+                self?.signOut()
+            }
+        )
+        bridge.setAccountDeletionHandler { [weak self] in
+            Task { @MainActor in await self?.deleteAccount() }
+        }
+        bridge.setCloudSyncHandlers(
+            sync: { [weak self] snapshotJSON in
+                Task { @MainActor in await self?.syncCloudSnapshot(localJSON: snapshotJSON) }
+            },
+            upload: { [weak self] snapshotJSON in
+                Task { @MainActor in await self?.uploadMergedCloudSnapshot(snapshotJSON) }
+            }
+        )
+        let currentDeviceID = cloudSyncDeviceID()
+        bridge.setDeviceManagementHandlers(
+            refresh: { [weak self, weak bridge] in
+                Task { @MainActor in
+                    guard let self, let bridge else { return }
+                    let devices = await self.registeredDevices()
+                    self.lastRegisteredDeviceRows = devices
+                    let ids = devices.compactMap { $0["deviceId"] as? String }
+                    let names = devices.map { $0["deviceName"] as? String ?? "" }
+                    let lastSeen = devices.map {
+                        String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                    }
+                    bridge.updateRegisteredDevices(
+                        deviceIds: ids,
+                        deviceNames: names,
+                        lastSeenEpochMillis: lastSeen,
+                        status: devices.isEmpty ? "device_empty" : nil
+                    )
+                }
+            },
+            revoke: { [weak self, weak bridge] deviceID in
+                Task { @MainActor in
+                    guard let self, let bridge else { return }
+                    if deviceID == currentDeviceID {
+                        let devices = self.lastRegisteredDeviceRows
+                        bridge.updateRegisteredDevices(
+                            deviceIds: devices.compactMap { $0["deviceId"] as? String },
+                            deviceNames: devices.map { $0["deviceName"] as? String ?? "" },
+                            lastSeenEpochMillis: devices.map {
+                                String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                            },
+                            status: "device_active"
+                        )
+                        return
+                    }
+                    let revoked = await self.revokeDevice(deviceID: deviceID)
+                    if revoked {
+                        let devices = await self.registeredDevices()
+                        self.lastRegisteredDeviceRows = devices
+                        bridge.updateRegisteredDevices(
+                            deviceIds: devices.compactMap { $0["deviceId"] as? String },
+                            deviceNames: devices.map { $0["deviceName"] as? String ?? "" },
+                            lastSeenEpochMillis: devices.map {
+                                String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                            },
+                            status: "device_revoked"
+                        )
+                    } else {
+                        let devices = self.lastRegisteredDeviceRows
+                        bridge.updateRegisteredDevices(
+                            deviceIds: devices.compactMap { $0["deviceId"] as? String },
+                            deviceNames: devices.map { $0["deviceName"] as? String ?? "" },
+                            lastSeenEpochMillis: devices.map {
+                                String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                            },
+                            status: "device_revoke_failed"
+                        )
+                    }
+                }
+            }
+        )
+        // Android parity (MainViewModel.replaceDevice): the blocking
+        // device-limit overlay's Remove replaces the selected old device with
+        // this device. This device is already registered, so revoking the old
+        // entry frees the slot; the refreshed list plus "device_revoked"
+        // lets Kotlin clear the limit like Android's replace success path.
+        bridge.setDeviceReplaceHandler { [weak self, weak bridge] deviceID in
+            Task { @MainActor in
+                guard let self, let bridge else { return }
+                if deviceID == currentDeviceID {
+                    let devices = self.lastRegisteredDeviceRows
+                    bridge.updateRegisteredDevices(
+                        deviceIds: devices.compactMap { $0["deviceId"] as? String },
+                        deviceNames: devices.map { $0["deviceName"] as? String ?? "" },
+                        lastSeenEpochMillis: devices.map {
+                            String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                        },
+                        status: "device_active"
+                    )
+                    return
+                }
+                let revoked = await self.revokeDevice(deviceID: deviceID)
+                if revoked {
+                    let devices = await self.registeredDevices()
+                    self.lastRegisteredDeviceRows = devices
+                    bridge.updateRegisteredDevices(
+                        deviceIds: devices.compactMap { $0["deviceId"] as? String },
+                        deviceNames: devices.map { $0["deviceName"] as? String ?? "" },
+                        lastSeenEpochMillis: devices.map {
+                            String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                        },
+                        status: "device_revoked"
+                    )
+                } else {
+                    bridge.updateRegisteredDevices(
+                        deviceIds: self.lastRegisteredDeviceRows.compactMap { $0["deviceId"] as? String },
+                        deviceNames: self.lastRegisteredDeviceRows.map { $0["deviceName"] as? String ?? "" },
+                        lastSeenEpochMillis: self.lastRegisteredDeviceRows.map {
+                            String(Int64(($0["lastSeenEpochMillis"] as? NSNumber)?.doubleValue ?? 0))
+                        },
+                        status: "device_revoke_failed"
+                    )
+                }
+            }
+        }
+        bridge.setCloudLocalDataClearHandler { [weak self, weak bridge] in
+            Task { @MainActor in
+                guard let self, let bridge else { return }
+                let result = await self.clearCloudAndLocalData(confirmedByUser: true)
+                switch result {
+                case .confirmationRequired:
+                    bridge.completeCloudLocalDataClear(
+                        success: false,
+                        message: "clear_confirmation_required"
+                    )
+                case .authorizationRequired:
+                    bridge.completeCloudLocalDataClear(
+                        success: false,
+                        message: "clear_authorization_required"
+                    )
+                case .inProgress:
+                    bridge.completeCloudLocalDataClear(
+                        success: false,
+                        message: "clear_in_progress"
+                    )
+                case .unavailable:
+                    bridge.completeCloudLocalDataClear(
+                        success: false,
+                        message: "clear_unavailable"
+                    )
+                case .cleared(let deletedDriveFileCount, let localCleanupInvoked):
+                    bridge.completeCloudLocalDataClear(
+                        success: localCleanupInvoked,
+                        message: localCleanupInvoked
+                            ? "clear_cleared|\(deletedDriveFileCount)"
+                            : "clear_local_cleanup_unavailable"
+                    )
+                case .failed(let message):
+                    bridge.completeCloudLocalDataClear(
+                        success: false,
+                        message: "clear_failed|\(message)"
+                    )
+                }
+            }
+        }
+        observeAccount()
+        if !anyCloudSyncInFlight {
+            scheduleCloudSyncRetryIfNeeded()
+        }
+    }
+
+    func handleOpenURL(_ url: URL) -> Bool {
+#if canImport(GoogleSignIn)
+        return GIDSignIn.sharedInstance.handle(url)
+#else
+        return false
+#endif
+    }
+
+    /// Installs the app-boundary cleanup hook for the confirmation-gated
+    /// clear-data action. The hook owns iOS library stores, imported content,
+    /// reader sessions, and local preferences; this controller owns the
+    /// account-scoped Drive/Firestore deletion. Keeping this boundary explicit
+    /// prevents a cloud retry from deleting local data twice.
+    func setLocalCloudDataClearHandler(_ handler: @escaping () -> Void) {
+        localCloudDataClearHandler = handler
+    }
+
+    /// Clears the same account data as Android's destructive cloud/local
+    /// action. Callers must obtain an explicit user confirmation first. Cloud
+    /// deletion completes before the local hook runs, so a transient network
+    /// failure never silently destroys the only local copy.
+    func clearCloudAndLocalData(confirmedByUser: Bool) async -> LocalCloudDataClearResult {
+        guard confirmedByUser else { return .confirmationRequired }
+        guard !cloudDataClearInFlight, !anyCloudSyncInFlight else { return .inProgress }
+#if canImport(FirebaseAuth) && canImport(FirebaseCore) && canImport(FirebaseFirestore) && canImport(GoogleSignIn)
+        guard
+            FirebaseApp.app() != nil,
+            let uid = Auth.auth().currentUser?.uid
+        else {
+            return .authorizationRequired
+        }
+        guard googleDriveAuthorized else { return .authorizationRequired }
+
+        cloudDataClearInFlight = true
+        cloudSyncGeneration += 1
+        let generation = cloudSyncGeneration
+        clearCloudSyncOutbox()
+        defer { cloudDataClearInFlight = false }
+
+        do {
+            let accessToken = try await googleDriveAccessToken()
+            let driveFiles = try await listDriveFiles(accessToken: accessToken)
+            for file in driveFiles {
+                try await deleteDriveFile(fileID: file.id, accessToken: accessToken)
+            }
+            guard generation == cloudSyncGeneration, Auth.auth().currentUser?.uid == uid else {
+                return .authorizationRequired
+            }
+            try await deleteCloudFirestoreData(uid: uid)
+            let localCleanupInvoked = localCloudDataClearHandler != nil
+            if let localCloudDataClearHandler {
+                localCloudDataClearHandler()
+            } else {
+                syncLogger.error("cloud_sync.clear_local_hook_missing")
+            }
+            syncLogger.info(
+                "cloud_sync.clear_success driveFiles=\(driveFiles.count) localCleanupInvoked=\(localCleanupInvoked)"
+            )
+            return .cleared(
+                deletedDriveFileCount: driveFiles.count,
+                localCleanupInvoked: localCleanupInvoked
+            )
+        } catch {
+            syncLogger.error(
+                "cloud_sync.clear_failed error=\(error.localizedDescription, privacy: .public)"
+            )
+            return .failed(error.localizedDescription)
+        }
+#else
+        return .unavailable
+#endif
+    }
+
+    /// Android uses this name for the same destructive settings action. Keep
+    /// it as the app-facing alias while retaining the explicit confirmation
+    /// argument at the native boundary.
+    func deleteAllCloudAndLocalData(confirmedByUser: Bool) async -> LocalCloudDataClearResult {
+        await clearCloudAndLocalData(confirmedByUser: confirmedByUser)
+    }
+
+    private func authenticate(provider: String) async {
+        switch provider {
+        case Provider.apple:
+            beginAppleSignIn()
+        case Provider.google:
+            await beginGoogleSignIn()
+        default:
+            publish(status: "Unsupported sign-in provider.")
+        }
+    }
+
+    private func beginAppleSignIn() {
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        guard FirebaseApp.app() != nil else {
+            publish(status: "GoogleService-Info.plist is missing from the iOS target.")
+            return
+        }
+        let nonce = Self.randomNonce()
+        appleNonce = nonce
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.requestedScopes = [.fullName, .email]
+        request.nonce = Self.sha256(nonce)
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        controller.delegate = self
+        controller.presentationContextProvider = self
+        controller.performRequests()
+#else
+        publish(status: "Apple login is ready for Firebase, but FirebaseAuth is not added to the iOS target yet.")
+#endif
+    }
+
+    private func beginGoogleSignIn() async {
+#if canImport(FirebaseAuth) && canImport(FirebaseCore) && canImport(GoogleSignIn)
+        guard FirebaseApp.app() != nil else {
+            publish(status: "GoogleService-Info.plist is missing from the iOS target.")
+            return
+        }
+        guard let presenter = Self.presentingViewController() else {
+            publish(status: "Could not present Google sign-in.")
+            return
+        }
+        do {
+            let result = try await GIDSignIn.sharedInstance.signIn(
+                withPresenting: presenter,
+                hint: nil,
+                additionalScopes: [Self.googleDriveScope]
+            )
+            guard let idToken = result.user.idToken?.tokenString else {
+                publish(status: "Google did not return an ID token.")
+                return
+            }
+            googleDriveAuthorized = result.user.grantedScopes?.contains(Self.googleDriveScope) == true
+            let credential = GoogleAuthProvider.credential(
+                withIDToken: idToken,
+                accessToken: result.user.accessToken.tokenString
+            )
+            try await signInOrLink(
+                credential: credential,
+                providerID: "google.com",
+                providerLabel: "Google"
+            )
+        } catch {
+            publish(status: Self.userFacingAuthError(error, provider: "Google"))
+        }
+#else
+        publish(status: "Google login needs FirebaseAuth, GoogleSignIn, and GoogleService-Info.plist in the iOS target.")
+#endif
+    }
+
+#if canImport(FirebaseAuth)
+    private func signInOrLink(
+        credential: AuthCredential,
+        providerID: String,
+        providerLabel: String
+    ) async throws {
+        let auth = Auth.auth()
+        if let user = auth.currentUser {
+            if user.providerData.contains(where: { $0.providerID == providerID }) {
+                try await user.reauthenticate(with: credential)
+                publish(status: "\(providerLabel) authorization refreshed.")
+                return
+            }
+            do {
+                try await user.link(with: credential)
+                publish(status: "\(providerLabel) linked.")
+            } catch {
+                let code = AuthErrorCode(_bridgedNSError: error as NSError)
+                if code == .credentialAlreadyInUse || code == .accountExistsWithDifferentCredential {
+                    publish(
+                        status: "\(providerLabel) belongs to another Episteme account. Nothing was changed; secure account merge is required."
+                    )
+                    return
+                }
+                throw error
+            }
+        } else {
+            try await auth.signIn(with: credential)
+            publish(status: "Signed in with \(providerLabel).")
+        }
+    }
+#endif
+
+    private func observeAccount() {
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        guard FirebaseApp.app() != nil else {
+            publish(status: "Add GoogleService-Info.plist to enable Apple and Google login.")
+            return
+        }
+        if let authStateHandle { Auth.auth().removeStateDidChangeListener(authStateHandle) }
+        authStateHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            Task { @MainActor in
+                guard let self else { return }
+                let nextUid = user?.uid
+                let previous = self.lastObservedUid
+                // Unconditional, not only on change: the failure this exists to
+                // catch is a publish that pushes uid:nil while Firebase still
+                // holds a session, which produces no transition at all.
+                self.logAccount(
+                    "auth_event previous=\(Self.uidToken(previous)) next=\(Self.uidToken(nextUid)) changed=\(previous != nextUid)"
+                )
+                if previous != nextUid {
+                    if previous != nil && nextUid == nil {
+                        self.logAccount("session_dropped reason=auth_state_change had=\(Self.uidToken(previous)) -> none")
+                    } else {
+                        self.logAccount("auth_state_change from=\(Self.uidToken(previous)) to=\(Self.uidToken(nextUid))")
+                    }
+                    self.lastObservedUid = nextUid
+                }
+                // Android parity (verifyDeviceForProUser + device listener): watch
+                // this installation's device document so a remote revocation
+                // ejects the local session immediately, and stop watching the
+                // previous account's device on sign-out/switch.
+                self.observeDeviceStatus(uid: user?.uid)
+                self.publish(status: nil)
+            }
+        }
+        restoreGoogleDriveAuthorization()
+#else
+        publish(status: "Add the iOS Firebase configuration to enable Apple and Google login.")
+#endif
+    }
+
+    /// Live `users/{uid}/devices/{deviceId}` status watch. A remote revocation
+    /// (issued from any signed-in device's device management screen) signs this
+    /// device out and clears its registration, mirroring Android's
+    /// DeviceStatus.Revoked path in MainViewModel.verifyDeviceForProUser.
+    private func observeDeviceStatus(uid: String?) {
+#if canImport(FirebaseFirestore) && canImport(FirebaseAuth)
+        deviceStatusListener?.remove()
+        deviceStatusListener = nil
+        guard let uid, !uid.isEmpty else { return }
+        let deviceID = cloudSyncDeviceID()
+        deviceStatusListener = Firestore.firestore()
+            .collection("users")
+            .document(uid)
+            .collection("devices")
+            .document(deviceID)
+            .addSnapshotListener { [weak self] snapshot, _ in
+                Task { @MainActor in
+                    guard let self, let snapshot, snapshot.exists else { return }
+                    guard (snapshot.data()?["status"] as? String) == "revoked" else { return }
+                    self.stopObservingDeviceStatus()
+                    // signOut() unregisters this device and clears the outbox;
+                    // the bridge then shows Android's "device removed" banner.
+                    self.logAccount("signout_requested source=device_revoked uid=\(Self.uidToken(uid))")
+                    self.signOut()
+                    self.bridge?.notifyCurrentDeviceRevoked()
+                }
+            }
+#endif
+    }
+
+    private func stopObservingDeviceStatus() {
+#if canImport(FirebaseFirestore)
+        deviceStatusListener?.remove()
+        deviceStatusListener = nil
+#endif
+    }
+
+    private func restoreGoogleDriveAuthorization() {
+#if canImport(GoogleSignIn)
+        Task {
+            // This publishes unconditionally, including on the `catch` branch
+            // where no Google session exists. Because it can resolve before
+            // Firebase has restored its own session, it can publish uid:nil and
+            // bounce the UI to signed-out; log both outcomes with the Firebase
+            // view at that instant so the ordering is provable.
+            let firebaseUid = Auth.auth().currentUser?.uid
+            do {
+                let user = try await GIDSignIn.sharedInstance.restorePreviousSignIn()
+                googleDriveAuthorized = user.grantedScopes?.contains(Self.googleDriveScope) == true
+                logAccount(
+                    "drive_restore ok granted=\(googleDriveAuthorized) firebaseUid=\(Self.uidToken(firebaseUid))"
+                )
+                publish(status: nil)
+            } catch {
+                googleDriveAuthorized = false
+                logAccount(
+                    "drive_restore failed error=\(error.localizedDescription) firebaseUid=\(Self.uidToken(firebaseUid))"
+                )
+                publish(status: nil)
+            }
+        }
+#endif
+    }
+
+    private func signOut() {
+        cloudSyncGeneration += 1
+        clearCloudSyncOutbox()
+        UserDefaults.standard.removeObject(forKey: Self.cloudShelfObservationsKey)
+        UserDefaults.standard.removeObject(forKey: Self.cloudFontObservationsKey)
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        if let uid = Auth.auth().currentUser?.uid {
+            Task { @MainActor in
+                await self.unregisterDevice(uid: uid)
+            }
+        }
+#endif
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        guard FirebaseApp.app() != nil else {
+            googleDriveAuthorized = false
+            publish(status: "Signed out.")
+            return
+        }
+        do {
+            try Auth.auth().signOut()
+#if canImport(GoogleSignIn)
+            GIDSignIn.sharedInstance.signOut()
+#endif
+            googleDriveAuthorized = false
+            publish(status: "Signed out.")
+        } catch {
+            publish(status: "Sign out failed: \(error.localizedDescription)")
+        }
+#else
+        googleDriveAuthorized = false
+        publish(status: "Signed out.")
+#endif
+    }
+
+    /// Permanently deletes the Episteme account. The shared UI confirms twice
+    /// before invoking this; Firebase still requires a fresh Apple credential,
+    /// so the Apple sheet is shown for re-authentication and the delegate
+    /// continues the pipeline via `reauthenticateAndDeleteAccount`.
+    func deleteAccount() async {
+        guard !accountDeletionInFlight, !pendingAccountDeletion else { return }
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        guard FirebaseApp.app() != nil else {
+            publish(status: "GoogleService-Info.plist is missing from the iOS target.")
+            bridge?.completeAccountDeletion(success: false, message: "Account deletion is unavailable.")
+            return
+        }
+        guard let user = Auth.auth().currentUser else {
+            publish(status: "You are not signed in.")
+            bridge?.completeAccountDeletion(success: false, message: "You are not signed in.")
+            return
+        }
+        // Google sign-in is hidden on iOS (Apple-only scope), so only the
+        // Apple re-auth path is implemented. A Google-linked account keeps
+        // working; deletion for it arrives with the Android/desktop path.
+        guard user.providerData.contains(where: { $0.providerID == "apple.com" }) else {
+            publish(status: "Account deletion on iOS needs an Apple-linked sign-in.")
+            bridge?.completeAccountDeletion(success: false, message: "Account deletion on iOS needs an Apple-linked sign-in.")
+            return
+        }
+        accountDeletionInFlight = true
+        pendingAccountDeletion = true
+        beginAppleSignIn()
+#else
+        publish(status: "Account deletion needs FirebaseAuth in the iOS target.")
+        bridge?.completeAccountDeletion(success: false, message: "Account deletion is unavailable.")
+#endif
+    }
+
+    private struct AccountDeleteResponse: Decodable {
+        let status: String
+        let message: String
+    }
+
+    private enum AccountDeleteError: LocalizedError {
+        case notSignedIn
+        case workerRejected(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .notSignedIn: return "You are not signed in."
+            case .workerRejected(let message): return message
+            }
+        }
+    }
+
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+    /// Re-authenticates with the fresh Apple credential (Firebase would reject
+    /// `user.delete()` on a stale session), then runs the destroy pipeline:
+    /// worker release → client Firestore/Drive cleanup → Auth deletion →
+    /// local sign-out. The worker step runs first so a lifetime Pro purchase
+    /// is released for reclaim; if a later step fails the user can retry and
+    /// the worker answers idempotently ("already deleted").
+    private func reauthenticateAndDeleteAccount(credential: AuthCredential) async throws {
+        guard let user = Auth.auth().currentUser else { throw AccountDeleteError.notSignedIn }
+        let uid = user.uid
+        do {
+            try await user.reauthenticate(with: credential)
+        } catch {
+            throw AccountDeleteError.workerRejected("Apple re-authentication failed: \(error.localizedDescription)")
+        }
+        let idToken: String = try await withCheckedThrowingContinuation { continuation in
+            user.getIDTokenForcingRefresh(true) { token, error in
+                if let token {
+                    continuation.resume(returning: token)
+                } else {
+                    continuation.resume(throwing: error ?? AccountDeleteError.notSignedIn)
+                }
+            }
+        }
+        do {
+            try await postAccountDelete(idToken: idToken)
+        } catch {
+            throw AccountDeleteError.workerRejected("Could not delete cloud account: \(error.localizedDescription)")
+        }
+        // Best-effort client cleanup. The user doc is already gone
+        // server-side; leftovers here only become unreachable orphans.
+        await deleteAccountSubcollections(uid: uid)
+#if canImport(GoogleSignIn)
+        if googleDriveAuthorized {
+            do {
+                let accessToken = try await googleDriveAccessToken()
+                for file in try await listDriveFiles(accessToken: accessToken) {
+                    try await deleteDriveFile(fileID: file.id, accessToken: accessToken)
+                }
+            } catch {
+                syncLogger.error("cloud_sync.delete_drive_cleanup_failed error=\(error.localizedDescription, privacy: .public)")
+            }
+        }
+#endif
+        await unregisterDevice(uid: uid)
+        do {
+            try await user.delete()
+        } catch {
+            // Data is gone but the Auth record survived (e.g. transient
+            // network). Retrying works: the worker call above is idempotent.
+            throw AccountDeleteError.workerRejected("Account data deleted, but final sign-out failed. Please try again: \(error.localizedDescription)")
+        }
+        logAccount("signout_requested source=account_deleted uid=\(Self.uidToken(uid))")
+        signOut()
+        publish(status: "Your Episteme account was permanently deleted.")
+    }
+
+    /// Calls the purchase-verifier's account endpoint. Never refunds: Apple
+    /// keeps the money; only the Firestore entitlement binding is released so
+    /// Pro can be reclaimed on a fresh account. Credits die with the doc.
+    private func postAccountDelete(idToken: String) async throws {
+        guard let url = URL(string: "https://episteme-verifier.aryanrajivyms.workers.dev/v2/account/delete") else {
+            throw AccountDeleteError.workerRejected("Account deletion is misconfigured.")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["idToken": idToken])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let message = (try? JSONDecoder().decode(AccountDeleteResponse.self, from: data).message)
+                ?? "Account deletion failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))."
+            throw AccountDeleteError.workerRejected(message)
+        }
+        let decoded = try JSONDecoder().decode(AccountDeleteResponse.self, from: data)
+        guard decoded.status == "success" else {
+            throw AccountDeleteError.workerRejected(decoded.message)
+        }
+    }
+
+    /// Removes account subcollections the worker intentionally leaves behind
+    /// (it owns the user doc + claim release). Deleting the parent doc does
+    /// not remove these; without this they would linger as orphans.
+    private func deleteAccountSubcollections(uid: String) async {
+#if canImport(FirebaseFirestore)
+        guard FirebaseApp.app() != nil else { return }
+        let database = Firestore.firestore()
+        for collectionName in ["books", "shelves", "fonts", "devices"] {
+            do {
+                let snapshot = try await database
+                    .collection("users")
+                    .document(uid)
+                    .collection(collectionName)
+                    .getDocuments()
+                let references = snapshot.documents.map(\.reference)
+                for chunk in stride(from: 0, to: references.count, by: 450) {
+                    let batch = database.batch()
+                    for reference in references[chunk..<min(chunk + 450, references.count)] {
+                        batch.deleteDocument(reference)
+                    }
+                    try await batch.commit()
+                }
+            } catch {
+                syncLogger.error("cloud_sync.delete_subcollection_failed collection=\(collectionName, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            }
+        }
+#endif
+    }
+#endif
+
+    /// Re-arms the pending outbox slots when the app returns from background
+    /// (Android: WorkManager re-gates on foreground via head listener + auth
+    /// collectors). No logic change: just re-invokes the existing retry
+    /// scheduler when no sync is in flight.
+    func handleForegroundResume() {
+        if !anyCloudSyncInFlight {
+            scheduleCloudSyncRetryIfNeeded()
+        }
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        // Safety net: a failed refresh schedules no follow-up, and a long
+        // suspension can outlast the TTL. Re-arm while signed in; the shared
+        // delay fires immediately when the token is already past its refresh
+        // point, otherwise it waits out the remainder.
+        if FirebaseApp.app() != nil, let uid = Auth.auth().currentUser?.uid,
+           authTokenRefreshTask == nil {
+            scheduleAuthTokenRefresh(uid: uid)
+        }
+#endif
+    }
+
+    /// BGTaskScheduler handler body. Runs inside a BGAppRefreshTask; the
+    /// caller owns setTaskCompleted. Kept idempotent like Android's
+    /// resetRunningOutbox-per-run so expiration mid-pass is safe to retry.
+    func handleBackgroundRefresh() async {
+        handleForegroundResume()
+    }
+
+    /// Drives whichever outbox slot is due soonest. Slots are independent
+    /// because pull and push may now run concurrently; a single slot would let
+    /// one operation's snapshot overwrite the other's.
+    private func scheduleCloudSyncRetryIfNeeded() {
+        cloudSyncRetryTask?.cancel()
+        let pending = pendingCloudSyncOutboxItems()
+        guard !pending.isEmpty else { return }
+        cloudSyncRetryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                // Slots can be replaced while this task is asleep (for example, a
+                // newer local edit arriving during an in-flight sync). Always reload
+                // before dispatching so a stale snapshot is never replayed.
+                let pending = self.pendingCloudSyncOutboxItems()
+                guard let item = pending.min(by: { $0.nextAttemptAt < $1.nextAttemptAt }) else { return }
+                let delay = max(0, item.nextAttemptAt.timeIntervalSinceNow)
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+                guard !Task.isCancelled else { return }
+                switch item.operation {
+                case .pull:
+                    await self.syncCloudSnapshot(localJSON: item.snapshotJSON)
+                case .push:
+                    await self.uploadMergedCloudSnapshot(item.snapshotJSON)
+                }
+                return
+            }
+        }
+    }
+
+    private func pendingCloudSyncOutboxItems() -> [CloudSyncOutboxItem] {
+        CloudSyncOperation.allCases.compactMap { loadCloudSyncOutbox($0) }
+    }
+
+    private static func cloudSyncOutboxKey(_ operation: CloudSyncOperation) -> String {
+        switch operation {
+        case .pull: return cloudSyncOutboxPullKey
+        case .push: return cloudSyncOutboxPushKey
+        }
+    }
+
+    /// Record a failed pass, or give up once the retry budget is spent.
+    ///
+    /// Android terminates rather than looping forever: `CloudFolderSyncWorker`
+    /// quarantines the outbox row once `attempts >= MAX_OUTBOX_ATTEMPTS` and
+    /// records the reason. iOS previously only clamped the attempt counter, so a
+    /// permanently failing pass retried every 256s indefinitely and never
+    /// surfaced. Quarantining clears the slot (a later trigger starts clean) and
+    /// returns the message to show, so the failure becomes visible instead of
+    /// silently looping.
+    private func recordCloudSyncFailure(
+        operation: CloudSyncOperation,
+        snapshotJSON: String,
+        previousAttempt: Int,
+        error: Error
+    ) -> String? {
+        let detail = safeCloudKitError(error)
+        guard previousAttempt < Self.cloudSyncRetryMaxAttempts else {
+            cloudKitLog(
+                "\(operation.rawValue)_quarantined attempt=\(previousAttempt) error=\(detail)"
+            )
+            clearCloudSyncOutbox(operation)
+            return "iCloud sync gave up after \(previousAttempt) attempts: \(detail)"
+        }
+        cloudKitLog(
+            "\(operation.rawValue)_retry_queued attempt=\(previousAttempt + 1) error=\(detail)"
+        )
+        saveCloudSyncOutbox(
+            snapshotJSON: snapshotJSON,
+            operation: operation,
+            previousAttempt: previousAttempt
+        )
+        return nil
+    }
+
+    private func loadCloudSyncOutbox(_ operation: CloudSyncOperation) -> CloudSyncOutboxItem? {
+        guard let data = UserDefaults.standard.data(forKey: Self.cloudSyncOutboxKey(operation)) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(CloudSyncOutboxItem.self, from: data)
+    }
+
+    private func saveCloudSyncOutbox(
+        snapshotJSON: String,
+        operation: CloudSyncOperation,
+        previousAttempt: Int
+    ) {
+        let attempt = min(previousAttempt + 1, Self.cloudSyncRetryMaxAttempts)
+        let delay = min(
+            Self.cloudSyncRetryMaxDelay,
+            pow(2, Double(attempt))
+        )
+        let item = CloudSyncOutboxItem(
+            snapshotJSON: snapshotJSON,
+            operation: operation,
+            attempt: attempt,
+            nextAttemptAt: Date().addingTimeInterval(delay)
+        )
+        if let data = try? JSONEncoder().encode(item) {
+            UserDefaults.standard.set(data, forKey: Self.cloudSyncOutboxKey(operation))
+        }
+        syncLogger.error(
+            "cloud_sync.outbox_saved operation=\(operation.rawValue, privacy: .public) attempt=\(attempt) bytes=\(snapshotJSON.utf8.count) retrySeconds=\(Int(delay))"
+        )
+        if !anyCloudSyncInFlight {
+            scheduleCloudSyncRetryIfNeeded()
+        }
+    }
+
+    private func clearCloudSyncOutbox(_ operation: CloudSyncOperation) {
+        UserDefaults.standard.removeObject(forKey: Self.cloudSyncOutboxKey(operation))
+    }
+
+    /// Clears every slot and stops the dispatcher. Used by the destructive
+    /// paths (sign-out, clear-all, account deletion) where no queued intent may
+    /// survive.
+    private func clearCloudSyncOutbox() {
+        for operation in CloudSyncOperation.allCases {
+            clearCloudSyncOutbox(operation)
+        }
+        // v1 was a single shared slot; nothing should remain, but a stale entry
+        // from an older build would otherwise be re-read by older code paths.
+        UserDefaults.standard.removeObject(forKey: "reader.ios.cloudSyncOutbox.v1")
+        cloudSyncRetryTask?.cancel()
+        cloudSyncRetryTask = nil
+    }
+
+    /// iOS keeps shelf state in the shared snapshot rather than Room. Track a
+    /// compact local observation so renames, membership edits, and deletions
+    /// still get Android-compatible clocks/tombstones on the next sync.
+    private func snapshotWithCloudShelfClocks(_ snapshotJSON: String) -> String {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let shelves = root["shelves"] as? [[String: Any]]
+        else { return snapshotJSON }
+
+        let previous: [String: CloudShelfObservation] = {
+            guard let stored = UserDefaults.standard.data(forKey: Self.cloudShelfObservationsKey) else {
+                return [:]
+            }
+            return (try? JSONDecoder().decode([String: CloudShelfObservation].self, from: stored)) ?? [:]
+        }()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let refs = root["bookShelfRefs"] as? [[String: Any]] ?? []
+        let bookIDsByShelf = Dictionary(grouping: refs) { $0["shelfId"] as? String ?? "" }
+            .mapValues { values in
+                values.compactMap { $0["bookId"] as? String }.sorted()
+            }
+        var current = previous
+        var activeIDs = Set<String>()
+        var preparedShelves: [[String: Any]] = []
+
+        for shelf in shelves {
+            guard
+                let id = shelf["id"] as? String,
+                let name = shelf["name"] as? String,
+                !id.isEmpty,
+                (shelf["isSmart"] as? Bool ?? false) == false
+            else {
+                preparedShelves.append(shelf)
+                continue
+            }
+            activeIDs.insert(id)
+            let deleted = shelf["isDeleted"] as? Bool ?? false
+            let previousObservation = previous[id]
+            var prepared = shelf
+            var clock = numericInt64(shelf["modifiedAt"])
+            if clock == 0 { clock = numericInt64(shelf["lastModifiedTimestamp"]) }
+            let bookIDs = bookIDsByShelf[id] ?? []
+            let changed = previousObservation.map {
+                $0.name != name || $0.bookIDs != bookIDs
+            } ?? false
+            if clock <= 0 {
+                clock = if let previousObservation, !previousObservation.isDeleted, !changed, !deleted {
+                    previousObservation.modifiedAt
+                } else {
+                    max(now, (previousObservation?.modifiedAt ?? 0) + 1)
+                }
+            } else if !deleted && changed && clock <= (previousObservation?.modifiedAt ?? 0) {
+                clock = max(now, (previousObservation?.modifiedAt ?? 0) + 1)
+            }
+            prepared["modifiedAt"] = clock
+            prepared["isDeleted"] = deleted
+            preparedShelves.append(prepared)
+            current[id] = CloudShelfObservation(
+                name: name,
+                modifiedAt: clock,
+                bookIDs: bookIDs,
+                isDeleted: deleted
+            )
+        }
+
+        // A shelf removed from the local shared state is retained as a
+        // tombstone. This mirrors Android's Room `isDeleted` row and prevents
+        // another device's older copy from resurrecting it.
+        for (id, observation) in previous where !activeIDs.contains(id) {
+            let deletedAt = observation.isDeleted
+                ? observation.modifiedAt
+                : max(now, observation.modifiedAt + 1)
+            preparedShelves.append([
+                "id": id,
+                "name": observation.name,
+                "isSmart": false,
+                "modifiedAt": deletedAt,
+                "isDeleted": true,
+            ])
+            current[id] = CloudShelfObservation(
+                name: observation.name,
+                modifiedAt: deletedAt,
+                bookIDs: observation.bookIDs,
+                isDeleted: true
+            )
+        }
+
+        root["shelves"] = preparedShelves
+        if let encoded = try? JSONEncoder().encode(current) {
+            UserDefaults.standard.set(encoded, forKey: Self.cloudShelfObservationsKey)
+        }
+        guard let encodedRoot = try? JSONSerialization.data(withJSONObject: root) else {
+            return snapshotJSON
+        }
+        return String(data: encodedRoot, encoding: .utf8) ?? snapshotJSON
+    }
+
+    private func snapshotWithCloudFontTombstones(_ snapshotJSON: String) -> String {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let fonts = root["customFonts"] as? [[String: Any]]
+        else { return snapshotJSON }
+
+        let previous: [String: CloudFontObservation] = {
+            guard let stored = UserDefaults.standard.data(forKey: Self.cloudFontObservationsKey) else {
+                return [:]
+            }
+            return (try? JSONDecoder().decode([String: CloudFontObservation].self, from: stored)) ?? [:]
+        }()
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var current = previous
+        var activeIDs = Set<String>()
+        var preparedFonts: [[String: Any]] = []
+
+        for font in fonts {
+            guard
+                let id = font["id"] as? String,
+                let displayName = font["displayName"] as? String,
+                let fileName = font["fileName"] as? String,
+                !id.isEmpty,
+                !fileName.isEmpty
+            else {
+                preparedFonts.append(font)
+                continue
+            }
+            activeIDs.insert(id)
+            let deleted = font["isDeleted"] as? Bool ?? false
+            let previousObservation = previous[id]
+            var prepared = font
+            var clock = numericInt64(font["timestamp"])
+            if clock <= 0 {
+                clock = max(now, (previousObservation?.timestamp ?? 0) + 1)
+            }
+            prepared["timestamp"] = clock
+            prepared["isDeleted"] = deleted
+            prepared["path"] = font["path"] as? String ?? ""
+            preparedFonts.append(prepared)
+            current[id] = CloudFontObservation(
+                displayName: displayName,
+                fileName: fileName,
+                fileExtension: font["fileExtension"] as? String ?? URL(fileURLWithPath: fileName).pathExtension,
+                timestamp: clock,
+                isDeleted: deleted
+            )
+        }
+
+        // Font deletion is represented as a Firestore tombstone until the
+        // remote metadata and Drive content have both observed it.
+        for (id, observation) in previous where !activeIDs.contains(id) {
+            let deletedAt = observation.isDeleted
+                ? observation.timestamp
+                : max(now, observation.timestamp + 1)
+            preparedFonts.append([
+                "id": id,
+                "displayName": observation.displayName,
+                "fileName": observation.fileName,
+                "fileExtension": observation.fileExtension,
+                "timestamp": deletedAt,
+                "isDeleted": true,
+                "path": "",
+            ])
+            current[id] = CloudFontObservation(
+                displayName: observation.displayName,
+                fileName: observation.fileName,
+                fileExtension: observation.fileExtension,
+                timestamp: deletedAt,
+                isDeleted: true
+            )
+        }
+
+        root["customFonts"] = preparedFonts
+        if let encoded = try? JSONEncoder().encode(current) {
+            UserDefaults.standard.set(encoded, forKey: Self.cloudFontObservationsKey)
+        }
+        guard let encodedRoot = try? JSONSerialization.data(withJSONObject: root) else {
+            return snapshotJSON
+        }
+        return String(data: encodedRoot, encoding: .utf8) ?? snapshotJSON
+    }
+
+    private func preparedCloudSnapshot(_ snapshotJSON: String) -> String {
+        snapshotWithLocalPdfSidecars(
+            snapshotWithCloudFontTombstones(snapshotWithCloudShelfClocks(snapshotJSON))
+        )
+    }
+
+    /// Include the durable sidecar mirror even while the shared reader is
+    /// still restoring its in-memory snapshot.  Once ReaderIosApp starts
+    /// carrying `pdfSidecars` itself this remains a compatibility fallback;
+    /// the two payloads are merged by their shared codec before transport.
+    private func snapshotWithLocalPdfSidecars(_ snapshotJSON: String) -> String {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return snapshotJSON }
+
+        let pdfBookIDs = Set<String>(
+            (root["books"] as? [[String: Any]] ?? []).compactMap { book -> String? in
+                guard
+                    let id = book["id"] as? String,
+                    (book["type"] as? String)?.uppercased() == "PDF",
+                    (book["sourceFolder"] is NSNull) || book["sourceFolder"] == nil,
+                    (book["path"] as? String)?.hasPrefix("opds-pse://") != true
+                else { return nil }
+                return id
+            }
+        )
+        guard !pdfBookIDs.isEmpty else { return snapshotJSON }
+
+        var sidecars = Dictionary(
+            uniqueKeysWithValues: parseCloudPdfSidecars(snapshotJSON).map { ($0.bookId, $0) }
+        )
+        for bookID in pdfBookIDs {
+            guard let local = localPdfSidecar(bookId: bookID) else { continue }
+            if let snapshotSidecar = sidecars[bookID] {
+                let preferSnapshot = snapshotSidecar.timestamp >= local.timestamp
+                let mergedData = mergePdfSidecarData(
+                    localData: local.data,
+                    remoteData: snapshotSidecar.data,
+                    preferRemoteOnConflict: preferSnapshot
+                )
+                sidecars[bookID] = CloudPdfSidecar(
+                    bookId: bookID,
+                    timestamp: max(local.timestamp, snapshotSidecar.timestamp),
+                    data: mergedData
+                )
+            } else {
+                sidecars[bookID] = local
+            }
+        }
+        guard !sidecars.isEmpty else { return snapshotJSON }
+        return injectPdfSidecars(
+            snapshotJSON,
+            sidecars: sidecars.values.sorted { $0.bookId < $1.bookId }
+        )
+    }
+
+    private func parseCloudPdfSidecars(_ snapshotJSON: String) -> [CloudPdfSidecar] {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let rawSidecars = root["pdfSidecars"] as? [[String: Any]]
+        else { return [] }
+        return rawSidecars.compactMap { raw -> CloudPdfSidecar? in
+            guard
+                let bookId = raw["bookId"] as? String,
+                !bookId.isEmpty,
+                let sidecarData = raw["data"] as? String,
+                !sidecarData.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            return CloudPdfSidecar(
+                bookId: bookId,
+                timestamp: numericInt64(raw["timestamp"]),
+                data: sidecarData
+            )
+        }
+    }
+
+    private func localPdfSidecar(bookId: String) -> CloudPdfSidecar? {
+        guard !bookId.isEmpty else { return nil }
+        let store = IosPdfCloudSidecarStore.shared
+        guard
+            let rawData = store.read(bookId: bookId),
+            !rawData.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            SharedPdfCloudSidecarCodec.shared.isCompatiblePayload(rawDataJson: rawData)
+        else { return nil }
+
+        let payload = SharedPdfCloudSidecarCodec.shared.decode(
+            rawDataJson: rawData,
+            fallbackPageCount: 1,
+            fallbackPageIndex: 0
+        )
+        let fileTimestamp = store.sidecarPath(bookId: bookId)
+            .flatMap { path in
+                (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate?
+                    .timeIntervalSince1970
+            }
+            .map { Int64($0 * 1000) } ?? 0
+        return CloudPdfSidecar(
+            bookId: bookId,
+            timestamp: max(payload?.modifiedTimestamp ?? 0, fileTimestamp),
+            data: rawData
+        )
+    }
+
+    private func mergePdfSidecarData(
+        localData: String,
+        remoteData: String,
+        preferRemoteOnConflict: Bool
+    ) -> String {
+        SharedPdfCloudSidecarCodec.shared.merge(
+            localDataJson: localData,
+            remoteDataJson: remoteData,
+            preferRemoteOnConflict: preferRemoteOnConflict,
+            fallbackPageCount: 1,
+            fallbackPageIndex: 0
+        )
+    }
+
+    private func writePdfSidecar(
+        bookId: String,
+        data: String,
+        modifiedTimestamp: Int64
+    ) -> Bool {
+        let store = IosPdfCloudSidecarStore.shared
+        guard store.write(bookId: bookId, payloadJson: data) else { return false }
+        guard modifiedTimestamp > 0,
+              let path = store.sidecarPath(bookId: bookId) else { return true }
+        try? FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: Double(modifiedTimestamp) / 1000)],
+            ofItemAtPath: path
+        )
+        return true
+    }
+
+    private func injectPdfSidecars(
+        _ snapshotJSON: String,
+        sidecars: [CloudPdfSidecar]
+    ) -> String {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return snapshotJSON }
+        root["pdfSidecars"] = sidecars
+            .sorted { $0.bookId < $1.bookId }
+            .map { sidecar in
+                [
+                    "bookId": sidecar.bookId,
+                    "timestamp": sidecar.timestamp,
+                    "data": sidecar.data,
+                ]
+            }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: root) else {
+            return snapshotJSON
+        }
+        return String(data: encoded, encoding: .utf8) ?? snapshotJSON
+    }
+
+    private func numericInt64(_ value: Any?) -> Int64 {
+        (value as? NSNumber)?.int64Value ?? 0
+    }
+
+    private func syncCloudSnapshot(localJSON: String) async {
+        if useCloudKitLibrarySync {
+            await syncCloudKitSnapshot(localJSON: localJSON)
+            return
+        }
+#if canImport(GoogleSignIn)
+        guard !cloudDataClearInFlight else {
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud data is being cleared."
+            )
+            return
+        }
+        if cloudSyncInFlight {
+            let previousAttempt = loadCloudSyncOutbox(.pull)?.attempt ?? 0
+            saveCloudSyncOutbox(
+                snapshotJSON: localJSON,
+                operation: .pull,
+                previousAttempt: previousAttempt
+            )
+            return
+        }
+        let preparedLocalJSON = preparedCloudSnapshot(localJSON)
+        let generation = cloudSyncGeneration
+        cloudSyncInFlight = true
+        defer {
+            cloudSyncInFlight = false
+            if loadCloudSyncOutbox(.push) != nil {
+                scheduleCloudSyncRetryIfNeeded()
+            }
+        }
+        let startedAt = Date()
+        do {
+            let accessToken = try await googleDriveAccessToken()
+            guard generation == cloudSyncGeneration else { return }
+            let remoteJSON = try await syncFirestoreBookMetadata(localJSON: preparedLocalJSON)
+            try await deleteCloudBookContentsForTombstones(
+                snapshotJSON: preparedLocalJSON,
+                accessToken: accessToken
+            )
+            try await deleteCloudPdfSidecarsForTombstones(
+                snapshotJSON: preparedLocalJSON,
+                accessToken: accessToken
+            )
+            // A remote tombstone can win even when this device has not yet
+            // recorded the deletion locally. Remove its Drive payload before
+            // applying the remote snapshot so stale content cannot be
+            // resurrected by a later retry.
+            try await deleteCloudBookContentsForTombstones(
+                snapshotJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            try await deleteCloudPdfSidecarsForTombstones(
+                snapshotJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            try await deleteCloudFontContentsForTombstones(
+                snapshotJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            let downloaded = try await downloadMissingCloudBooks(
+                localJSON: preparedLocalJSON,
+                remoteJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            let downloadedFonts = try await downloadMissingCloudFonts(
+                localJSON: preparedLocalJSON,
+                remoteJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            let downloadedSidecars = try await downloadMissingCloudPdfSidecars(
+                localJSON: preparedLocalJSON,
+                remoteJSON: remoteJSON,
+                accessToken: accessToken
+            )
+            guard generation == cloudSyncGeneration else { return }
+            let hydratedRemoteJSON = injectPdfSidecars(
+                injectDownloadedFontPaths(
+                    remoteJSON,
+                    pathsByFontID: downloadedFonts
+                ),
+                sidecars: downloadedSidecars.map {
+                    CloudPdfSidecar(bookId: $0.bookId, timestamp: $0.timestamp, data: $0.data)
+                }
+            )
+            clearCloudSyncOutbox(.pull)
+            syncLogger.info(
+                "cloud_sync.pull_success bytes=\(preparedLocalJSON.utf8.count) remoteBytes=\(hydratedRemoteJSON.utf8.count) books=\(downloaded.count) fonts=\(downloadedFonts.count) pdfSidecars=\(downloadedSidecars.count) elapsedMs=\(Int(Date().timeIntervalSince(startedAt) * 1000))"
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: hydratedRemoteJSON,
+                downloadedBookIds: downloaded.map(\.id),
+                downloadedBookPaths: downloaded.map(\.path),
+                status: downloaded.isEmpty
+                    ? "Cloud reading progress downloaded."
+                    : "Downloaded \(downloaded.count) cloud book(s)."
+            )
+        } catch {
+            guard generation == cloudSyncGeneration else { return }
+            let previousAttempt = loadCloudSyncOutbox(.pull)?.attempt ?? 0
+            saveCloudSyncOutbox(
+                snapshotJSON: preparedLocalJSON,
+                operation: .pull,
+                previousAttempt: previousAttempt
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud sync failed: \(error.localizedDescription)"
+            )
+        }
+#else
+        bridge?.completeCloudSync(
+            remoteSnapshotJson: nil,
+            downloadedBookIds: [],
+            downloadedBookPaths: [],
+            status: "Google Sign-In is required for cloud sync."
+        )
+#endif
+    }
+
+    private func uploadMergedCloudSnapshot(_ snapshotJSON: String) async {
+        if useCloudKitLibrarySync {
+            await uploadMergedCloudKitSnapshot(snapshotJSON)
+            return
+        }
+#if canImport(GoogleSignIn)
+        guard !cloudDataClearInFlight else {
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud data is being cleared."
+            )
+            return
+        }
+        if cloudSyncInFlight {
+            let previousAttempt = loadCloudSyncOutbox(.push)?.attempt ?? 0
+            saveCloudSyncOutbox(
+                snapshotJSON: snapshotJSON,
+                operation: .push,
+                previousAttempt: previousAttempt
+            )
+            return
+        }
+        let preparedSnapshotJSON = preparedCloudSnapshot(snapshotJSON)
+        let generation = cloudSyncGeneration
+        cloudSyncInFlight = true
+        defer {
+            cloudSyncInFlight = false
+            if loadCloudSyncOutbox(.push) != nil {
+                scheduleCloudSyncRetryIfNeeded()
+            }
+        }
+        let startedAt = Date()
+        do {
+            let accessToken = try await googleDriveAccessToken()
+            guard generation == cloudSyncGeneration else { return }
+            let uploadedSidecars = try await uploadCloudPdfSidecars(
+                snapshotJSON: preparedSnapshotJSON,
+                accessToken: accessToken
+            )
+            try await uploadCloudBookContents(
+                snapshotJSON: preparedSnapshotJSON,
+                accessToken: accessToken
+            )
+            try await uploadCloudFontContents(
+                snapshotJSON: preparedSnapshotJSON,
+                accessToken: accessToken
+            )
+            _ = try await syncFirestoreBookMetadata(localJSON: preparedSnapshotJSON)
+            try await deleteCloudBookContentsForTombstones(
+                snapshotJSON: preparedSnapshotJSON,
+                accessToken: accessToken
+            )
+            try await deleteCloudPdfSidecarsForTombstones(
+                snapshotJSON: preparedSnapshotJSON,
+                accessToken: accessToken
+            )
+            guard generation == cloudSyncGeneration else { return }
+            clearCloudSyncOutbox(.push)
+            syncLogger.info(
+                "cloud_sync.push_success bytes=\(preparedSnapshotJSON.utf8.count) pdfSidecars=\(uploadedSidecars.count) elapsedMs=\(Int(Date().timeIntervalSince(startedAt) * 1000))"
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud reading progress is up to date."
+            )
+        } catch {
+            guard generation == cloudSyncGeneration else { return }
+            let previousAttempt = loadCloudSyncOutbox(.push)?.attempt ?? 0
+            saveCloudSyncOutbox(
+                snapshotJSON: preparedSnapshotJSON,
+                operation: .push,
+                previousAttempt: previousAttempt
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud upload failed: \(error.localizedDescription)"
+            )
+        }
+#endif
+    }
+
+    /// The stable installation identifier is also needed by the settings
+    /// bridge when Firebase modules are unavailable in a target.
+    /// Shared with the folder-sync executor (device binding identity).
+    func folderSyncDeviceID() -> String { cloudSyncDeviceID() }
+
+    // MARK: - Pure CloudKit library sync (Pro)
+
+    /// Data-plane selector. Pure CloudKit first; Drive/Firestore stays
+    /// dormant for later cross-platform work.
+    var useCloudKitLibrarySync: Bool {
+        UserDefaults.standard.object(forKey: Self.cloudKitSyncEnabledKey) as? Bool ?? true
+    }
+
+    func setCloudKitLibrarySyncEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.cloudKitSyncEnabledKey)
+    }
+
+    /// Pro gate published by ContentView from StoreKit truth.
+    func setProSyncEnabled(_ enabled: Bool) {
+        isProForCloudKitSync = enabled
+    }
+
+    private func requireCloudKitPro() throws {
+        guard isProForCloudKitSync else { throw CloudSyncError.proRequired }
+    }
+
+    private func completeCloudKitGateFailure(_ error: Error) {
+        let message: String
+        switch error as? CloudSyncError {
+        case .proRequired:
+            message = "iCloud sync is a Pro feature."
+        case .iCloudUnavailable:
+            message = "Sign in to iCloud to enable sync."
+        default:
+            message = "iCloud sync failed: \(error.localizedDescription)"
+        }
+        bridge?.completeCloudSync(
+            remoteSnapshotJson: nil,
+            downloadedBookIds: [],
+            downloadedBookPaths: [],
+            status: message
+        )
+    }
+
+    /// Current Firebase UID for the folder-sync executor/store scope.
+    func folderSyncAccountID() -> String? {
+#if canImport(FirebaseAuth)
+        return Auth.auth().currentUser?.uid
+#else
+        return nil
+#endif
+    }
+
+    private func cloudSyncDeviceID() -> String {
+        if let existing = UserDefaults.standard.string(forKey: Self.syncDeviceIDKey) {
+            return existing
+        }
+        let value = "ios-\(UUID().uuidString.lowercased())"
+        UserDefaults.standard.set(value, forKey: Self.syncDeviceIDKey)
+        return value
+    }
+
+#if canImport(FirebaseFirestore) && canImport(FirebaseAuth)
+    private func syncFirestoreBookMetadata(localJSON: String) async throws -> String {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            throw CloudSyncError.firebaseAccountRequired
+        }
+        do {
+            try await registerCurrentDevice(uid: uid)
+        } catch {
+            syncLogger.error("cloud_sync.device_register_failed error=\(error.localizedDescription, privacy: .public)")
+        }
+        guard
+            let data = localJSON.data(using: .utf8),
+            var localRoot = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let localBooks = localRoot["books"] as? [[String: Any]]
+        else {
+            throw CloudSyncError.invalidSnapshot
+        }
+
+        let localShelfRecords = localRoot["shelves"] as? [[String: Any]] ?? []
+        let localShelfRefs = localRoot["bookShelfRefs"] as? [[String: Any]] ?? []
+        let localFonts = localRoot["customFonts"] as? [[String: Any]] ?? []
+
+        let collection = Firestore.firestore()
+            .collection("users")
+            .document(uid)
+            .collection("books")
+        let query = try await collection.getDocuments()
+        let remoteDocuments = Dictionary(
+            uniqueKeysWithValues: query.documents.map { ($0.documentID, $0.data()) }
+        )
+        var effectiveDocuments = remoteDocuments
+        let localTombstones = localRoot["bookTombstones"] as? [[String: Any]] ?? []
+        let localByID = Dictionary(
+            uniqueKeysWithValues: localBooks.compactMap { book -> (String, [String: Any])? in
+                guard let id = book["id"] as? String else { return nil }
+                return (id, book)
+            }
+        )
+
+        for (bookID, localBook) in localByID {
+            guard cloudBookIsFirestoreSyncable(localBook) else { continue }
+            let localFields = firestoreFields(from: localBook)
+            let localTimestamp = numericInt64(localFields["lastModifiedTimestamp"])
+            let remoteTimestamp = numericInt64(remoteDocuments[bookID]?["lastModifiedTimestamp"])
+            let localDeleteTimestamp = localTombstones
+                .filter { $0["bookId"] as? String == bookID }
+                .map { numericInt64($0["deletedAt"]) }
+                .max() ?? 0
+            guard localTimestamp > localDeleteTimestamp else { continue }
+            // Shared LWW truth (Android consumes the same CloudSyncDecisions
+            // in SyncWorker/full-sync): upload when no remote doc exists or
+            // the local clock wins. The local clock already folds the PDF
+            // sidecar timestamp in via firestoreFields, so no separate
+            // sidecar term is passed.
+            if remoteDocuments[bookID] == nil || CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                localModifiedTimestamp: localTimestamp,
+                remoteModifiedTimestamp: remoteTimestamp,
+                localSidecarModifiedTimestamp: 0
+            ) {
+                try await collection.document(bookID).setData(localFields)
+                effectiveDocuments[bookID] = localFields
+            }
+        }
+
+        for tombstone in localTombstones {
+            guard let bookID = tombstone["bookId"] as? String else { continue }
+            let deletedAt = numericInt64(tombstone["deletedAt"])
+            let remoteTimestamp = numericInt64(effectiveDocuments[bookID]?["lastModifiedTimestamp"])
+            // Tombstone publish is the same shared LWW decision with the
+            // deletion clock as the local side (Android: mergedCloudBookTombstones).
+            guard effectiveDocuments[bookID] == nil || CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                localModifiedTimestamp: deletedAt,
+                remoteModifiedTimestamp: remoteTimestamp,
+                localSidecarModifiedTimestamp: 0
+            ) else { continue }
+            let fields: [String: Any] = [
+                "bookId": bookID,
+                "type": tombstone["type"] as? String ?? "",
+                "isDeleted": true,
+                "lastModifiedTimestamp": deletedAt,
+                "readingPositionModifiedTimestamp": 0,
+                "annotationModifiedTimestamp": 0,
+                "originDeviceId": cloudSyncDeviceID(),
+            ]
+            try await collection.document(bookID).setData(fields, merge: true)
+            effectiveDocuments[bookID] = (effectiveDocuments[bookID] ?? [:])
+                .merging(fields) { _, new in new }
+        }
+
+        let shelfMerge = try await syncFirestoreShelves(
+            uid: uid,
+            localRecords: localShelfRecords,
+            localRefs: localShelfRefs,
+            syncableBookIDs: Set(localByID.keys).union(effectiveDocuments.keys)
+        )
+        let mergedFonts = try await syncFirestoreFonts(
+            uid: uid,
+            localFonts: localFonts
+        )
+
+        let remoteBooks = effectiveDocuments.values.compactMap { fields -> [String: Any]? in
+            guard (fields["isDeleted"] as? Bool) != true else { return nil }
+            return snapshotBook(fromFirestore: fields)
+        }
+        localRoot["books"] = remoteBooks
+        localRoot["shelves"] = shelfMerge.records
+        localRoot["bookShelfRefs"] = shelfMerge.refs
+        localRoot["customFonts"] = mergedFonts
+        // PDF sidecar bytes are transported through Drive, not Firestore.
+        // Do not echo the local snapshot's sidecars as if they were remote;
+        // the Drive phase injects only the remote files that it observed.
+        localRoot["pdfSidecars"] = []
+        localRoot["bookTombstones"] = effectiveDocuments.values.compactMap { fields -> [String: Any]? in
+            guard
+                (fields["isDeleted"] as? Bool) == true,
+                let bookID = fields["bookId"] as? String
+            else {
+                return nil
+            }
+            return [
+                "bookId": bookID,
+                "type": nullableJSONValue(fields["type"]),
+                "deletedAt": numericInt64(fields["lastModifiedTimestamp"]),
+            ]
+        }
+        let remoteData = try JSONSerialization.data(withJSONObject: localRoot)
+        guard let remoteJSON = String(data: remoteData, encoding: .utf8) else {
+            throw CloudSyncError.invalidSnapshot
+        }
+        return remoteJSON
+    }
+
+    private struct ShelfMergeResult {
+        let records: [[String: Any]]
+        let refs: [[String: Any]]
+    }
+
+    private func syncFirestoreShelves(
+        uid: String,
+        localRecords: [[String: Any]],
+        localRefs: [[String: Any]],
+        syncableBookIDs: Set<String>
+    ) async throws -> ShelfMergeResult {
+        let collection = Firestore.firestore()
+            .collection("users")
+            .document(uid)
+            .collection("shelves")
+        let query = try await collection.getDocuments()
+        var effective: [String: [String: Any]] = [:]
+        for document in query.documents {
+            var fields = document.data()
+            if fields["shelfId"] == nil { fields["shelfId"] = document.documentID }
+            guard let shelfID = fields["shelfId"] as? String, !shelfID.isEmpty else { continue }
+            let currentClock = numericInt64(effective[shelfID]?["lastModifiedTimestamp"])
+            let candidateClock = numericInt64(fields["lastModifiedTimestamp"])
+            if effective[shelfID] == nil || candidateClock >= currentClock {
+                effective[shelfID] = fields
+            }
+        }
+        let localRefsByShelf = Dictionary(grouping: localRefs) {
+            $0["shelfId"] as? String ?? ""
+        }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+
+        for local in localRecords {
+            guard
+                let shelfID = local["id"] as? String,
+                !(local["isSmart"] as? Bool ?? false),
+                !shelfID.isEmpty
+            else { continue }
+            let refs = localRefsByShelf[shelfID] ?? []
+            let bookIDs = refs.compactMap { $0["bookId"] as? String }
+                .filter { syncableBookIDs.contains($0) }
+            let localClock = numericInt64(local["modifiedAt"])
+            let remoteClock = numericInt64(effective[shelfID]?["lastModifiedTimestamp"])
+            let isDeleted = local["isDeleted"] as? Bool ?? false
+            // Shared LWW truth (same CloudSyncDecisions comparator as books).
+            let shouldUpload = effective[shelfID] == nil ||
+                (localClock > 0 && CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                    localModifiedTimestamp: localClock,
+                    remoteModifiedTimestamp: remoteClock,
+                    localSidecarModifiedTimestamp: 0
+                ))
+            guard shouldUpload else { continue }
+            let clock = localClock > 0 ? localClock : max(now, remoteClock + 1)
+            let fields: [String: Any] = [
+                "shelfId": shelfID,
+                "name": local["name"] as? String ?? shelfID,
+                "bookIds": bookIDs,
+                "lastModifiedTimestamp": clock,
+                "isDeleted": isDeleted,
+                "originDeviceId": cloudSyncDeviceID(),
+            ]
+            try await collection.document(shelfID).setData(fields, merge: false)
+            effective[shelfID] = fields
+        }
+
+        var records: [[String: Any]] = []
+        var refs: [[String: Any]] = []
+        for fields in effective.values {
+            guard let shelfID = fields["shelfId"] as? String, !shelfID.isEmpty else { continue }
+            let isDeleted = fields["isDeleted"] as? Bool ?? false
+            records.append([
+                "id": shelfID,
+                "name": fields["name"] as? String ?? shelfID,
+                "isSmart": false,
+                "modifiedAt": numericInt64(fields["lastModifiedTimestamp"]),
+                "isDeleted": isDeleted,
+            ])
+            guard !isDeleted else { continue }
+            let bookIDs = fields["bookIds"] as? [String] ?? []
+            let clock = numericInt64(fields["lastModifiedTimestamp"])
+            // Shared append-only rule (mergeCloudShelfRefs keeps the newest
+            // addedAt per pair): preserve this device's known clocks for
+            // surviving pairs instead of re-stamping clock+index every pass.
+            let localAddedAtByBookID = Dictionary(
+                (localRefsByShelf[shelfID] ?? []).compactMap { ref -> (String, Int64)? in
+                    guard let bookID = ref["bookId"] as? String else { return nil }
+                    return (bookID, numericInt64(ref["addedAt"]))
+                },
+                uniquingKeysWith: { max($0, $1) }
+            )
+            refs.append(contentsOf: bookIDs.enumerated().map { index, bookID in
+                [
+                    "bookId": bookID,
+                    "shelfId": shelfID,
+                    // Kotlin Long? bridges as KotlinLong? (not NSNumber?);
+                    // wrap the locally known Int64 clock like ContentView.swift does.
+                    "addedAt": CloudLibrarySnapshotMergeKt.sharedShelfRefAddedAt(
+                        existingAddedAt: localAddedAtByBookID[bookID].map { KotlinLong(longLong: $0) },
+                        shelfClock: clock,
+                        index: Int32(index)
+                    ),
+                ]
+            })
+        }
+        return ShelfMergeResult(
+            records: records.sorted { ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "") },
+            refs: refs.sorted {
+                let left = ($0["shelfId"] as? String ?? "", numericInt64($0["addedAt"]))
+                let right = ($1["shelfId"] as? String ?? "", numericInt64($1["addedAt"]))
+                return left.0 == right.0 ? left.1 < right.1 : left.0 < right.0
+            }
+        )
+    }
+
+    private func syncFirestoreFonts(
+        uid: String,
+        localFonts: [[String: Any]]
+    ) async throws -> [[String: Any]] {
+        let collection = Firestore.firestore()
+            .collection("users")
+            .document(uid)
+            .collection("fonts")
+        let query = try await collection.getDocuments()
+        var effective = Dictionary(uniqueKeysWithValues: query.documents.map { document in
+            var fields = document.data()
+            if fields["id"] == nil { fields["id"] = document.documentID }
+            return (document.documentID, fields)
+        })
+        for local in localFonts {
+            guard let fontID = local["id"] as? String, !fontID.isEmpty else { continue }
+            let localTimestamp = numericInt64(local["timestamp"])
+            let remoteTimestamp = numericInt64(effective[fontID]?["timestamp"])
+            // Font metadata uses the same shared last-writer-wins clock as
+            // books (CloudSyncDecisions). This also allows a newer local font
+            // to supersede an older remote tombstone instead of getting stuck
+            // behind `isDeleted`.
+            let shouldUpload = effective[fontID] == nil || CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                localModifiedTimestamp: localTimestamp,
+                remoteModifiedTimestamp: remoteTimestamp,
+                localSidecarModifiedTimestamp: 0
+            )
+            guard shouldUpload else { continue }
+            let clock = localTimestamp > 0
+                ? localTimestamp
+                : max(Int64(Date().timeIntervalSince1970 * 1000), remoteTimestamp + 1)
+            let fields: [String: Any] = [
+                "id": fontID,
+                "displayName": local["displayName"] as? String ?? fontID,
+                "fileName": local["fileName"] as? String ?? "",
+                "fileExtension": local["fileExtension"] as? String ?? "",
+                "timestamp": clock,
+                "isDeleted": local["isDeleted"] as? Bool ?? false,
+            ]
+            try await collection.document(fontID).setData(fields, merge: false)
+            effective[fontID] = fields
+        }
+        return effective.values.compactMap { fields in
+            guard let id = fields["id"] as? String, !id.isEmpty else { return nil }
+            let localPath = localFonts.first(where: { $0["id"] as? String == id })?["path"] as? String
+            return [
+                "id": id,
+                "displayName": fields["displayName"] as? String ?? id,
+                "fileName": fields["fileName"] as? String ?? "",
+                "fileExtension": fields["fileExtension"] as? String ?? "",
+                "timestamp": numericInt64(fields["timestamp"]),
+                "isDeleted": fields["isDeleted"] as? Bool ?? false,
+                // Paths are device-local and are never written to Firestore.
+                // Keep this device's path in the returned snapshot so a
+                // metadata-only sync cannot make an installed font disappear.
+                "path": localPath ?? "",
+            ]
+        }.sorted { ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "") }
+    }
+
+    private func firestoreFields(from book: [String: Any]) -> [String: Any] {
+        let position = book["readerPosition"] as? [String: Any]
+        let readingTimestamp = numericInt64(book["readingPositionModifiedTimestamp"])
+        let metadataTimestamp = numericInt64(book["metadataModifiedTimestamp"])
+        let baseTimestamp = numericInt64(book["timestamp"])
+        let highlights = book["readerHighlights"] as? [Any] ?? []
+        let bookmarks = book["readerBookmarks"] as? [[String: Any]] ?? []
+        let isPdf = (book["type"] as? String)?.uppercased() == "PDF"
+        let localSidecar = isPdf ? localPdfSidecar(bookId: book["id"] as? String ?? "") : nil
+        let legacyHasAnnotations = !highlights.isEmpty || !bookmarks.isEmpty
+        let annotationTimestamp = max(
+            numericInt64(book["annotationModifiedTimestamp"]),
+            localSidecar?.timestamp ?? 0
+        )
+        let hasAnnotations = legacyHasAnnotations || localSidecar != nil ||
+            (book["hasAnnotations"] as? Bool ?? false)
+        return [
+            "bookId": book["id"] as? String ?? "",
+            "title": nullableFirestoreValue(book["title"]),
+            "author": nullableFirestoreValue(book["author"]),
+            "displayName": book["displayName"] as? String ?? "",
+            "type": book["type"] as? String ?? "",
+            "lastPositionCfi": nullableFirestoreValue(stablePositionCFI(position)),
+            "lastChapterIndex": nullableFirestoreValue(position?["chapterIndex"]),
+            "locatorBlockIndex": nullableFirestoreValue(position?["blockIndex"]),
+            "locatorCharOffset": nullableFirestoreValue(position?["charOffset"]),
+            "lastPage": nullableFirestoreValue(book["lastPageIndex"]),
+            "progressPercentage": nullableFirestoreValue(book["progressPercentage"]),
+            "isRecent": book["isRecent"] as? Bool ?? true,
+            "isDeleted": false,
+            "lastModifiedTimestamp": max(baseTimestamp, readingTimestamp, metadataTimestamp, annotationTimestamp),
+            "readingPositionModifiedTimestamp": readingTimestamp,
+            "annotationModifiedTimestamp": annotationTimestamp,
+            "bookmarksJson": jsonStringValue(androidBookmarkPayload(bookmarks)),
+            "originDeviceId": cloudSyncDeviceID(),
+            "hasAnnotations": hasAnnotations,
+            "fileContentModifiedTimestamp": numericInt64(book["fileContentModifiedTimestamp"]),
+            "customName": NSNull(),
+            "highlightsJson": jsonStringValue(highlights),
+            "seriesName": nullableFirestoreValue(book["seriesName"]),
+            "seriesIndex": nullableFirestoreValue(book["seriesIndex"]),
+            "description": nullableFirestoreValue(book["description"]),
+            "originalTitle": nullableFirestoreValue(book["originalTitle"] ?? book["title"]),
+            "originalAuthor": nullableFirestoreValue(book["originalAuthor"] ?? book["author"]),
+            "originalSeriesName": nullableFirestoreValue(book["originalSeriesName"] ?? book["seriesName"]),
+            "originalSeriesIndex": nullableFirestoreValue(book["originalSeriesIndex"] ?? book["seriesIndex"]),
+            "originalDescription": nullableFirestoreValue(book["originalDescription"] ?? book["description"]),
+        ]
+    }
+
+    private func snapshotBook(fromFirestore fields: [String: Any]) -> [String: Any]? {
+        guard
+            let id = fields["bookId"] as? String,
+            let displayName = fields["displayName"] as? String,
+            let type = fields["type"] as? String
+        else {
+            return nil
+        }
+        let cfi = fields["lastPositionCfi"] as? String
+        let chapterIndex = optionalInt(fields["lastChapterIndex"])
+        let pageIndex = optionalInt(fields["lastPage"])
+        let blockIndex = optionalInt(fields["locatorBlockIndex"])
+        let charOffset = optionalInt(fields["locatorCharOffset"])
+        var position: [String: Any] = [:]
+        if let cfi { position["cfi"] = cfi }
+        if let chapterIndex { position["chapterIndex"] = chapterIndex }
+        if let pageIndex { position["pageIndex"] = pageIndex }
+        if let blockIndex { position["blockIndex"] = blockIndex }
+        if let charOffset { position["charOffset"] = charOffset }
+
+        return [
+            "id": id,
+            "path": NSNull(),
+            "type": type,
+            "displayName": displayName,
+            "timestamp": numericInt64(fields["lastModifiedTimestamp"]),
+            "annotationModifiedTimestamp": numericInt64(fields["annotationModifiedTimestamp"]),
+            "hasAnnotations": fields["hasAnnotations"] as? Bool ?? false,
+            "title": nullableJSONValue(fields["title"]),
+            "author": nullableJSONValue(fields["author"]),
+            "description": nullableJSONValue(fields["description"]),
+            "originalTitle": nullableJSONValue(fields["originalTitle"]),
+            "originalAuthor": nullableJSONValue(fields["originalAuthor"]),
+            "originalSeriesName": nullableJSONValue(fields["originalSeriesName"]),
+            "originalSeriesIndex": nullableJSONValue(fields["originalSeriesIndex"]),
+            "originalDescription": nullableJSONValue(fields["originalDescription"]),
+            "progressPercentage": nullableJSONValue(fields["progressPercentage"]),
+            "isRecent": fields["isRecent"] as? Bool ?? true,
+            "isAvailable": false,
+            "fileSize": 0,
+            "fileContentModifiedTimestamp": numericInt64(fields["fileContentModifiedTimestamp"]),
+            "metadataModifiedTimestamp": numericInt64(fields["lastModifiedTimestamp"]),
+            "sourceFolder": NSNull(),
+            "folderTextMetadataParsed": false,
+            "seriesName": nullableJSONValue(fields["seriesName"]),
+            "seriesIndex": nullableJSONValue(fields["seriesIndex"]),
+            "tags": [],
+            "lastPageIndex": pageIndex.map(NSNumber.init(value:)) ?? NSNull(),
+            "readerPosition": position.isEmpty ? NSNull() : position,
+            "readerSettings": NSNull(),
+            "readerFormatIsLocal": false,
+            "readerLocalFormatSettings": NSNull(),
+            "readerAutoScrollIsLocal": false,
+            "readerAutoScrollLocalSpeed": NSNull(),
+            "readerBookmarks": sharedBookmarks(from: fields["bookmarksJson"] as? String),
+            "readerHighlights": jsonArray(from: fields["highlightsJson"] as? String),
+            "pdfReaderViewport": NSNull(),
+            "readingPositionModifiedTimestamp": numericInt64(fields["readingPositionModifiedTimestamp"]),
+            "titleSortKey": nullableJSONValue(fields["customName"]),
+        ]
+    }
+
+    private func cloudBookIsFirestoreSyncable(_ book: [String: Any]) -> Bool {
+        guard (book["sourceFolder"] is NSNull) || book["sourceFolder"] == nil else { return false }
+        guard let path = book["path"] as? String, !path.hasPrefix("opds-pse://") else { return false }
+        guard let displayName = book["displayName"] as? String else { return false }
+        return !CloudBook.manualOnlyExtensions.contains(
+            URL(fileURLWithPath: displayName).pathExtension.lowercased()
+        )
+    }
+
+    private func stablePositionCFI(_ position: [String: Any]?) -> String? {
+        if let cfi = position?["cfi"] as? String, !cfi.isEmpty { return cfi }
+        guard let chapter = optionalInt(position?["chapterIndex"]) else { return nil }
+        if
+            let block = optionalInt(position?["blockIndex"]),
+            let character = optionalInt(position?["charOffset"])
+        {
+            return "android-locator:\(chapter):\(block):\(character)"
+        }
+        if let page = optionalInt(position?["pageIndex"]) {
+            return "desktop:\(chapter):\(page)"
+        }
+        return nil
+    }
+
+    private func androidBookmarkPayload(_ bookmarks: [[String: Any]]) -> [String] {
+        bookmarks.compactMap { bookmark in
+            var android = bookmark
+            let locator = bookmark["locator"] as? [String: Any]
+            android["cfi"] = stablePositionCFI(locator) ?? bookmark["id"] as? String ?? ""
+            android["chapterTitle"] = bookmark["chapterTitle"] as? String ?? ""
+            android["snippet"] = bookmark["preview"] as? String ?? ""
+            android["chapterIndex"] = optionalInt(locator?["chapterIndex"]) ?? 0
+            guard let data = try? JSONSerialization.data(withJSONObject: android) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+    }
+
+    private func sharedBookmarks(from raw: String?) -> [[String: Any]] {
+        guard
+            let entries = jsonArray(from: raw) as? [String]
+        else {
+            return []
+        }
+        return entries.compactMap { entry in
+            guard
+                let data = entry.data(using: .utf8),
+                let bookmark = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                return nil
+            }
+            let page = max((bookmark["pageInChapter"] as? NSNumber)?.intValue ?? 1, 1) - 1
+            return [
+                "id": bookmark["cfi"] as? String ?? UUID().uuidString,
+                "pageIndex": page,
+                "chapterTitle": bookmark["chapterTitle"] as? String ?? "",
+                "preview": bookmark["snippet"] as? String ?? "",
+                "label": nullableJSONValue(bookmark["label"]),
+                "locator": bookmark["locator"] as? [String: Any] ?? [:],
+            ]
+        }
+    }
+
+    private func jsonArray(from raw: String?) -> [Any] {
+        guard
+            let raw,
+            let data = raw.data(using: .utf8),
+            let array = try? JSONSerialization.jsonObject(with: data) as? [Any]
+        else {
+            return []
+        }
+        return array
+    }
+
+    private func jsonStringValue(_ value: Any) -> Any {
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: value),
+            let string = String(data: data, encoding: .utf8)
+        else {
+            return NSNull()
+        }
+        return string
+    }
+
+    private func nullableFirestoreValue(_ value: Any?) -> Any {
+        value is NSNull || value == nil ? NSNull() : value!
+    }
+
+    private func nullableJSONValue(_ value: Any?) -> Any {
+        value is NSNull || value == nil ? NSNull() : value!
+    }
+
+    private func optionalInt(_ value: Any?) -> Int? {
+        (value as? NSNumber)?.intValue
+    }
+
+    private func registerCurrentDevice(uid: String) async throws {
+        let deviceID = cloudSyncDeviceID()
+        let deviceName = UIDevice.current.name.isEmpty
+            ? "iPhone \(UIDevice.current.model)"
+            : UIDevice.current.name
+        let fields: [String: Any] = [
+            "deviceName": deviceName,
+            "lastSeen": FieldValue.serverTimestamp(),
+            "status": "active",
+            "platform": "ios",
+            "originDeviceId": deviceID,
+        ]
+        try await Firestore.firestore()
+            .collection("users")
+            .document(uid)
+            .collection("devices")
+            .document(deviceID)
+            .setData(fields, merge: true)
+    }
+
+    private func unregisterDevice(uid: String) async {
+#if canImport(FirebaseFirestore)
+        guard FirebaseApp.app() != nil else { return }
+        do {
+            try await Firestore.firestore()
+                .collection("users")
+                .document(uid)
+                .collection("devices")
+                .document(cloudSyncDeviceID())
+                .delete()
+        } catch {
+            syncLogger.error("cloud_sync.device_unregister_failed error=\(error.localizedDescription, privacy: .public)")
+        }
+#endif
+    }
+
+    /// Mirrors Android's clear-cloud scope: user book and shelf metadata are
+    /// removed, while profile/purchase data and the account itself remain.
+    /// Drive content (books, fonts, and PDF sidecars) is deleted by the
+    /// confirmation-gated caller before this method runs.
+    private func deleteCloudFirestoreData(uid: String) async throws {
+        let database = Firestore.firestore()
+        for collectionName in ["books", "shelves"] {
+            let snapshot = try await database
+                .collection("users")
+                .document(uid)
+                .collection(collectionName)
+                .getDocuments()
+            let references = snapshot.documents.map(\.reference)
+            for chunk in stride(from: 0, to: references.count, by: 450) {
+                let batch = database.batch()
+                for reference in references[chunk..<min(chunk + 450, references.count)] {
+                    batch.deleteDocument(reference)
+                }
+                try await batch.commit()
+            }
+        }
+    }
+
+    /// Read-only device management API for the iOS settings host. The shared
+    /// UI can opt into these handlers without coupling itself to Firebase.
+    func registeredDevices() async -> [[String: Any]] {
+#if canImport(FirebaseFirestore) && canImport(FirebaseAuth)
+        guard let uid = Auth.auth().currentUser?.uid else { return [] }
+        do {
+            let snapshot = try await Firestore.firestore()
+                .collection("users")
+                .document(uid)
+                .collection("devices")
+                .whereField("status", isEqualTo: "active")
+                .getDocuments()
+            return snapshot.documents.map { document in
+                [
+                    "deviceId": document.documentID,
+                    "deviceName": document.get("deviceName") as? String ?? document.documentID,
+                    "lastSeenEpochMillis": ((document.get("lastSeen") as? Timestamp)?.dateValue().timeIntervalSince1970 ?? 0) * 1000,
+                ]
+            }
+        } catch {
+            syncLogger.error("cloud_sync.device_list_failed error=\(error.localizedDescription, privacy: .public)")
+            return []
+        }
+#else
+        return []
+#endif
+    }
+
+    func revokeDevice(deviceID: String) async -> Bool {
+#if canImport(FirebaseFirestore) && canImport(FirebaseAuth)
+        guard let uid = Auth.auth().currentUser?.uid, !deviceID.isEmpty else { return false }
+        do {
+            try await Firestore.firestore()
+                .collection("users")
+                .document(uid)
+                .collection("devices")
+                .document(deviceID)
+                .setData(["status": "revoked", "originDeviceId": cloudSyncDeviceID()], merge: true)
+            return true
+        } catch {
+            syncLogger.error("cloud_sync.device_revoke_failed error=\(error.localizedDescription, privacy: .public)")
+            return false
+        }
+#else
+        return false
+#endif
+    }
+#else
+    private func syncFirestoreBookMetadata(localJSON: String) async throws -> String {
+        throw CloudSyncError.firestoreUnavailable
+    }
+
+    private func unregisterDevice(uid: String) async {}
+#endif
+
+#if canImport(GoogleSignIn)
+    private struct DriveFile: Decodable {
+        let id: String
+        let name: String
+        let modifiedTime: String?
+    }
+
+    private struct DriveFileList: Decodable {
+        let files: [DriveFile]
+        let nextPageToken: String?
+    }
+
+    private struct CloudBook {
+        let id: String
+        let type: String
+        let displayName: String
+        let path: String?
+        let sourceFolder: String?
+        let fileContentModifiedTimestamp: Int64
+        let annotationModifiedTimestamp: Int64
+        let hasAnnotations: Bool
+
+        var driveFileName: String? {
+            guard sourceFolder == nil, path?.hasPrefix("opds-pse://") != true else { return nil }
+            guard !Self.isManualOnly(displayName) else { return nil }
+            guard let ext = Self.primaryExtension(forType: type) else { return nil }
+            return "\(id).\(ext)"
+        }
+
+        /// Cloud file extension for a book, from the shared capability table
+        /// (`SharedFileCapabilities.primaryExtensionFor`) so the remote name
+        /// cannot drift from Android's. The previous hardcoded Swift table was
+        /// both a duplicate and incomplete: an unknown type fell through to a
+        /// `.bin` upload on iOS while Android refuses to upload it at all, so
+        /// the two platforms could disagree on a book's cloud filename.
+        fileprivate static func primaryExtension(forType type: String) -> String? {
+            guard let fileType = FileType.entries.first(where: { $0.name == type }) else { return nil }
+            return SharedFileCapabilities.shared.primaryExtensionFor(type: fileType)
+        }
+
+        fileprivate static let manualOnlyExtensions: Set<String> = [
+            "json", "xml", "yaml", "yml", "toml", "csv", "tsv", "js", "ts",
+            "kt", "kts", "swift", "java", "c", "cc", "cpp", "h", "hpp",
+            "py", "rb", "rs", "go", "sh", "zsh", "css",
+        ]
+
+        private static func isManualOnly(_ name: String) -> Bool {
+            manualOnlyExtensions.contains(
+                URL(fileURLWithPath: name).pathExtension.lowercased()
+            )
+        }
+    }
+
+    private struct DownloadedCloudBook {
+        let id: String
+        let path: String
+    }
+
+    private struct CloudFont {
+        let id: String
+        let displayName: String
+        let fileName: String
+        let fileExtension: String
+        let timestamp: Int64
+        let isDeleted: Bool
+        let path: String?
+
+        var safeFileName: String {
+            let candidate = URL(fileURLWithPath: fileName).lastPathComponent
+            return candidate.isEmpty ? "font-\(id).\(fileExtension)" : candidate
+        }
+    }
+
+    /// Shared with the folder-sync executor (Drive transport auth).
+    func folderSyncAccessToken() async throws -> String { try await googleDriveAccessToken() }
+
+    private func googleDriveAccessToken() async throws -> String {
+        guard googleDriveAuthorized, let user = GIDSignIn.sharedInstance.currentUser else {
+            throw CloudSyncError.googleAuthorizationRequired
+        }
+        let refreshedUser = try await user.refreshTokensIfNeeded()
+        guard refreshedUser.grantedScopes?.contains(Self.googleDriveScope) == true else {
+            googleDriveAuthorized = false
+            publish(status: nil)
+            throw CloudSyncError.googleAuthorizationRequired
+        }
+        return refreshedUser.accessToken.tokenString
+    }
+
+    private func listDriveFiles(accessToken: String) async throws -> [DriveFile] {
+        var files: [DriveFile] = []
+        var pageToken: String?
+        var seenPageTokens = Set<String>()
+        repeat {
+            var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+            components.queryItems = [
+                URLQueryItem(name: "spaces", value: "appDataFolder"),
+                URLQueryItem(name: "q", value: "trashed = false"),
+                URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,modifiedTime)"),
+                URLQueryItem(name: "pageSize", value: "1000"),
+            ]
+            if let pageToken {
+                components.queryItems?.append(URLQueryItem(name: "pageToken", value: pageToken))
+            }
+            let data = try await driveRequest(
+                url: components.url!,
+                method: "GET",
+                accessToken: accessToken
+            )
+            let page = try JSONDecoder().decode(DriveFileList.self, from: data)
+            files.append(contentsOf: page.files)
+            guard let next = page.nextPageToken?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty else {
+                pageToken = nil
+                break
+            }
+            guard seenPageTokens.insert(next).inserted else {
+                throw CloudSyncError.invalidDrivePageToken
+            }
+            pageToken = next
+        } while pageToken != nil
+        return files
+    }
+
+    private func parseCloudBooks(_ snapshotJSON: String) throws -> [CloudBook] {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let books = root["books"] as? [[String: Any]]
+        else {
+            throw CloudSyncError.invalidSnapshot
+        }
+        return books.compactMap { book in
+            guard
+                let id = book["id"] as? String,
+                let type = book["type"] as? String,
+                let displayName = book["displayName"] as? String
+            else {
+                return nil
+            }
+            return CloudBook(
+                id: id,
+                type: type,
+                displayName: displayName,
+                path: book["path"] as? String,
+                sourceFolder: book["sourceFolder"] as? String,
+                fileContentModifiedTimestamp: (book["fileContentModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+                annotationModifiedTimestamp: numericInt64(book["annotationModifiedTimestamp"]),
+                hasAnnotations: book["hasAnnotations"] as? Bool ?? false
+            )
+        }
+    }
+
+    private func downloadMissingCloudBooks(
+        localJSON: String,
+        remoteJSON: String,
+        accessToken: String
+    ) async throws -> [DownloadedCloudBook] {
+        let localBooks = try parseCloudBooks(localJSON)
+        let localByID = Dictionary(uniqueKeysWithValues: localBooks.map { ($0.id, $0) })
+        let remoteBooks = try parseCloudBooks(remoteJSON)
+            .filter { remote in
+                guard remote.driveFileName != nil else { return false }
+                guard let local = localByID[remote.id] else { return true }
+                let localURL = local.path.flatMap(resolveCloudBookPath)
+                let localExists = localURL.map {
+                    FileManager.default.fileExists(atPath: $0.path)
+                } ?? false
+                return !localExists ||
+                    remote.fileContentModifiedTimestamp > local.fileContentModifiedTimestamp
+            }
+        guard !remoteBooks.isEmpty else { return [] }
+        let filesByName = driveFilesByName(
+            try await listDriveFiles(accessToken: accessToken)
+        )
+        let imports = try cloudImportsDirectory()
+        var downloaded: [DownloadedCloudBook] = []
+
+        for book in remoteBooks {
+            guard
+                let driveName = book.driveFileName,
+                let driveFile = filesByName[driveName]
+            else {
+                continue
+            }
+            let safeName = driveName.replacingOccurrences(of: "/", with: "_")
+            let destination = imports.appendingPathComponent(safeName)
+            let temporary = imports.appendingPathComponent(".\(safeName).\(UUID().uuidString).download")
+            do {
+                let data = try await downloadDriveFile(
+                    fileID: driveFile.id,
+                    accessToken: accessToken
+                )
+                try data.write(to: temporary, options: .atomic)
+                try commitStagedCloudFile(temporary, to: destination)
+                if book.fileContentModifiedTimestamp > 0 {
+                    try? FileManager.default.setAttributes(
+                        [.modificationDate: Date(timeIntervalSince1970: Double(book.fileContentModifiedTimestamp) / 1000)],
+                        ofItemAtPath: destination.path
+                    )
+                }
+                downloaded.append(DownloadedCloudBook(id: book.id, path: destination.path))
+            } catch {
+                try? FileManager.default.removeItem(at: temporary)
+                throw error
+            }
+        }
+        return downloaded
+    }
+
+    private func uploadCloudBookContents(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws {
+        let books = try parseCloudBooks(snapshotJSON)
+        let driveFiles = try await listDriveFiles(accessToken: accessToken)
+        let filesByName = driveFilesByName(driveFiles)
+
+        for book in books {
+            guard
+                let driveName = book.driveFileName,
+                let storedPath = book.path,
+                let localURL = resolveCloudBookPath(storedPath),
+                FileManager.default.fileExists(atPath: localURL.path)
+            else {
+                continue
+            }
+            let localModified = (
+                try? localURL.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate?
+                    .timeIntervalSince1970
+            ) ?? 0
+            let remoteFile = filesByName[driveName]
+            let remoteModified = remoteFile?.modifiedTime
+                .flatMap(Self.driveDateFormatter.date(from:))?
+                .timeIntervalSince1970 ?? 0
+            if remoteFile != nil && remoteModified >= localModified {
+                continue
+            }
+            let content = try Data(contentsOf: localURL, options: .mappedIfSafe)
+            try await uploadDriveFile(
+                content,
+                name: driveName,
+                fileID: remoteFile?.id,
+                accessToken: accessToken
+            )
+        }
+    }
+
+    private func parseCloudFonts(_ snapshotJSON: String) throws -> [CloudFont] {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let fonts = root["customFonts"] as? [[String: Any]]
+        else {
+            throw CloudSyncError.invalidSnapshot
+        }
+        return fonts.compactMap { font in
+            guard
+                let id = font["id"] as? String,
+                let fileName = font["fileName"] as? String,
+                !id.isEmpty,
+                !fileName.isEmpty
+            else { return nil }
+            return CloudFont(
+                id: id,
+                displayName: font["displayName"] as? String ?? id,
+                fileName: fileName,
+                fileExtension: font["fileExtension"] as? String ?? URL(fileURLWithPath: fileName).pathExtension,
+                timestamp: numericInt64(font["timestamp"]),
+                isDeleted: font["isDeleted"] as? Bool ?? false,
+                path: font["path"] as? String
+            )
+        }
+    }
+
+    private func cloudFontsDirectory() throws -> URL {
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("Fonts", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func downloadMissingCloudFonts(
+        localJSON: String,
+        remoteJSON: String,
+        accessToken: String
+    ) async throws -> [String: String] {
+        let localFonts = try parseCloudFonts(localJSON)
+        let localByID = Dictionary(uniqueKeysWithValues: localFonts.map { ($0.id, $0) })
+        let remoteFonts = try parseCloudFonts(remoteJSON).filter { !$0.isDeleted }
+        guard !remoteFonts.isEmpty else { return [:] }
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        let destinationDirectory = try cloudFontsDirectory()
+        var downloaded: [String: String] = [:]
+        for font in remoteFonts {
+            let destination = destinationDirectory.appendingPathComponent(font.safeFileName)
+            let local = localByID[font.id]
+            let localExists = local?.path.flatMap { FileManager.default.fileExists(atPath: $0) } ?? false
+            if localExists && font.timestamp <= (local?.timestamp ?? 0) { continue }
+            guard let driveFile = filesByName[font.safeFileName] ?? filesByName[font.fileName] else {
+                continue
+            }
+            let temporary = destinationDirectory.appendingPathComponent(".\(font.safeFileName).\(UUID().uuidString).download")
+            do {
+                let data = try await downloadDriveFile(fileID: driveFile.id, accessToken: accessToken)
+                try data.write(to: temporary, options: .atomic)
+                try commitStagedCloudFile(temporary, to: destination)
+                if font.timestamp > 0 {
+                    try? FileManager.default.setAttributes(
+                        [.modificationDate: Date(timeIntervalSince1970: Double(font.timestamp) / 1000)],
+                        ofItemAtPath: destination.path
+                    )
+                }
+                downloaded[font.id] = destination.path
+            } catch {
+                try? FileManager.default.removeItem(at: temporary)
+                throw error
+            }
+        }
+        syncLogger.info("cloud_sync.font_downloads count=\(downloaded.count)")
+        return downloaded
+    }
+
+    /// Commits an app-owned cloud download without deleting the previous
+    /// destination first. Foundation's replacement operation is atomic for
+    /// sibling files; if it rejects the commit, the old readable file stays
+    /// in place and the caller removes only the staged path.
+    private func commitStagedCloudFile(_ staged: URL, to destination: URL) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(
+                destination,
+                withItemAt: staged,
+                backupItemName: nil,
+                options: []
+            )
+        } else {
+            try fileManager.moveItem(at: staged, to: destination)
+        }
+    }
+
+    private func uploadCloudFontContents(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws {
+        let fonts = try parseCloudFonts(snapshotJSON)
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        for font in fonts {
+            if font.isDeleted {
+                if let file = filesByName[font.safeFileName] ?? filesByName[font.fileName] {
+                    try await deleteDriveFile(fileID: file.id, accessToken: accessToken)
+                }
+                continue
+            }
+            guard
+                let path = font.path,
+                FileManager.default.fileExists(atPath: path)
+            else { continue }
+            let localURL = URL(fileURLWithPath: path)
+            let data = try Data(contentsOf: localURL, options: .mappedIfSafe)
+            let remote = filesByName[font.safeFileName] ?? filesByName[font.fileName]
+            let localModified = (
+                try? localURL.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate?
+                    .timeIntervalSince1970
+            ) ?? (Double(font.timestamp) / 1000)
+            let remoteModified = remote?.modifiedTime
+                .flatMap(Self.driveDateFormatter.date(from:))?
+                .timeIntervalSince1970 ?? 0
+            if remote != nil && remoteModified >= localModified {
+                continue
+            }
+            try await uploadDriveFile(
+                data,
+                name: font.safeFileName,
+                fileID: remote?.id,
+                accessToken: accessToken
+            )
+        }
+    }
+
+    private func pdfSidecarsFromSnapshot(_ snapshotJSON: String) -> [CloudPdfSidecar] {
+        let pdfBookIDs = Set(
+            (try? parseCloudBooks(snapshotJSON))?.filter {
+                $0.type.uppercased() == "PDF" && $0.driveFileName != nil
+            }
+                .map(\.id) ?? []
+        )
+        guard !pdfBookIDs.isEmpty else { return [] }
+        return parseCloudPdfSidecars(snapshotJSON)
+            .filter { pdfBookIDs.contains($0.bookId) }
+    }
+
+    private func downloadMissingCloudPdfSidecars(
+        localJSON: String,
+        remoteJSON: String,
+        accessToken: String
+    ) async throws -> [DownloadedCloudPdfSidecar] {
+        let remoteBooks = try parseCloudBooks(remoteJSON)
+            .filter { $0.type.uppercased() == "PDF" && $0.driveFileName != nil }
+        guard !remoteBooks.isEmpty else { return [] }
+
+        let localSidecars = Dictionary(
+            uniqueKeysWithValues: pdfSidecarsFromSnapshot(localJSON).map { ($0.bookId, $0) }
+        )
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        var downloaded: [DownloadedCloudPdfSidecar] = []
+        for book in remoteBooks {
+            let fileName = SharedPdfCloudSidecarCodec.shared.driveFileName(bookId: book.id)
+            guard let driveFile = filesByName[fileName] else { continue }
+            let remoteTimestamp = driveModifiedTimestamp(driveFile.modifiedTime)
+            let localSidecar = localSidecars[book.id] ?? localPdfSidecar(bookId: book.id)
+            let localTimestamp = max(
+                localSidecar?.timestamp ?? 0,
+                book.annotationModifiedTimestamp
+            )
+            // If the snapshot already contains a durable local copy, only
+            // fetch Drive when the server has a strictly newer revision.
+            guard localSidecar == nil || remoteTimestamp > localTimestamp else {
+                continue
+            }
+            let rawData = try await downloadDriveFile(
+                fileID: driveFile.id,
+                accessToken: accessToken
+            )
+            guard let remoteData = String(data: rawData, encoding: .utf8),
+                  SharedPdfCloudSidecarCodec.shared.isCompatiblePayload(rawDataJson: remoteData)
+            else {
+                syncLogger.error(
+                    "cloud_sync.pdf_sidecar_invalid book=\(book.id, privacy: .public) bytes=\(rawData.count)"
+                )
+                continue
+            }
+            let mergedData = localSidecar.map {
+                mergePdfSidecarData(
+                    localData: $0.data,
+                    remoteData: remoteData,
+                    preferRemoteOnConflict: true
+                )
+            } ?? remoteData
+            let appliedTimestamp = max(remoteTimestamp, localTimestamp)
+            guard writePdfSidecar(
+                bookId: book.id,
+                data: mergedData,
+                modifiedTimestamp: appliedTimestamp
+            ) else {
+                throw CloudSyncError.sidecarPersistenceFailed(book.id)
+            }
+            downloaded.append(
+                DownloadedCloudPdfSidecar(
+                    bookId: book.id,
+                    timestamp: appliedTimestamp,
+                    bytes: mergedData.utf8.count,
+                    data: mergedData
+                )
+            )
+            syncLogger.info(
+                "cloud_sync.pdf_sidecar_download book=\(book.id, privacy: .public) remoteTs=\(remoteTimestamp) appliedTs=\(appliedTimestamp) bytes=\(mergedData.utf8.count)"
+            )
+        }
+        return downloaded
+    }
+
+    private func uploadCloudPdfSidecars(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws -> [CloudPdfSidecar] {
+        let localSidecars = pdfSidecarsFromSnapshot(snapshotJSON)
+        guard !localSidecars.isEmpty else { return [] }
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        var uploaded: [CloudPdfSidecar] = []
+        for sidecar in localSidecars {
+            let fileName = SharedPdfCloudSidecarCodec.shared.driveFileName(bookId: sidecar.bookId)
+            let remoteFile = filesByName[fileName]
+            let remoteTimestamp = driveModifiedTimestamp(remoteFile?.modifiedTime)
+            guard remoteFile == nil || sidecar.timestamp > remoteTimestamp else {
+                syncLogger.debug(
+                    "cloud_sync.pdf_sidecar_upload_skip book=\(sidecar.bookId, privacy: .public) localTs=\(sidecar.timestamp) remoteTs=\(remoteTimestamp)"
+                )
+                continue
+            }
+            var uploadData = sidecar.data
+            if let remoteFile {
+                let rawRemoteData = try await downloadDriveFile(
+                    fileID: remoteFile.id,
+                    accessToken: accessToken
+                )
+                if let remoteData = String(data: rawRemoteData, encoding: .utf8),
+                   SharedPdfCloudSidecarCodec.shared.isCompatiblePayload(rawDataJson: remoteData) {
+                    uploadData = mergePdfSidecarData(
+                        localData: sidecar.data,
+                        remoteData: remoteData,
+                        preferRemoteOnConflict: false
+                    )
+                }
+            }
+            let response = try await uploadDriveFile(
+                Data(uploadData.utf8),
+                name: fileName,
+                fileID: remoteFile?.id,
+                accessToken: accessToken,
+                contentType: "application/json"
+            )
+            let uploadedTimestamp = max(
+                driveModifiedTimestamp(response?.modifiedTime),
+                max(sidecar.timestamp, remoteTimestamp)
+            )
+            guard writePdfSidecar(
+                bookId: sidecar.bookId,
+                data: uploadData,
+                modifiedTimestamp: uploadedTimestamp
+            ) else {
+                throw CloudSyncError.sidecarPersistenceFailed(sidecar.bookId)
+            }
+            uploaded.append(
+                CloudPdfSidecar(
+                    bookId: sidecar.bookId,
+                    timestamp: uploadedTimestamp,
+                    data: uploadData
+                )
+            )
+            syncLogger.info(
+                "cloud_sync.pdf_sidecar_upload book=\(sidecar.bookId, privacy: .public) localTs=\(sidecar.timestamp) driveTs=\(uploadedTimestamp) bytes=\(uploadData.utf8.count)"
+            )
+        }
+        return uploaded
+    }
+
+    private func injectDownloadedFontPaths(
+        _ snapshotJSON: String,
+        pathsByFontID: [String: String]
+    ) -> String {
+        guard
+            !pathsByFontID.isEmpty,
+            let data = snapshotJSON.data(using: .utf8),
+            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            var fonts = root["customFonts"] as? [[String: Any]]
+        else { return snapshotJSON }
+        for index in fonts.indices {
+            guard let id = fonts[index]["id"] as? String,
+                  let path = pathsByFontID[id] else { continue }
+            fonts[index]["path"] = path
+        }
+        root["customFonts"] = fonts
+        guard let encoded = try? JSONSerialization.data(withJSONObject: root) else {
+            return snapshotJSON
+        }
+        return String(data: encoded, encoding: .utf8) ?? snapshotJSON
+    }
+
+    private func deleteCloudBookContentsForTombstones(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let tombstones = root["bookTombstones"] as? [[String: Any]],
+            !tombstones.isEmpty
+        else {
+            return
+        }
+        let filesByName = driveFilesByName(
+            try await listDriveFiles(accessToken: accessToken)
+        )
+        for tombstone in tombstones {
+            guard
+                let bookID = tombstone["bookId"] as? String,
+                let type = tombstone["type"] as? String,
+                let fileExtension = CloudBook.primaryExtension(forType: type),
+                let driveFile = filesByName["\(bookID).\(fileExtension)"]
+            else {
+                continue
+            }
+            try await deleteDriveFile(fileID: driveFile.id, accessToken: accessToken)
+        }
+    }
+
+    private func deleteCloudPdfSidecarsForTombstones(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws {
+        guard
+            let data = snapshotJSON.data(using: .utf8),
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let tombstones = root["bookTombstones"] as? [[String: Any]],
+            !tombstones.isEmpty
+        else { return }
+
+        let pdfBookIDs = Set(tombstones.compactMap { tombstone -> String? in
+            guard
+                let bookId = tombstone["bookId"] as? String,
+                (tombstone["type"] as? String)?.uppercased() == "PDF"
+            else { return nil }
+            return bookId
+        })
+        guard !pdfBookIDs.isEmpty else { return }
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        for bookId in pdfBookIDs {
+            let fileName = SharedPdfCloudSidecarCodec.shared.driveFileName(bookId: bookId)
+            if let driveFile = filesByName[fileName] {
+                try await deleteDriveFile(fileID: driveFile.id, accessToken: accessToken)
+            }
+            _ = IosPdfCloudSidecarStore.shared.delete(bookId: bookId)
+            syncLogger.info("cloud_sync.pdf_sidecar_deleted book=\(bookId, privacy: .public)")
+        }
+    }
+
+    private func deleteCloudFontContentsForTombstones(
+        snapshotJSON: String,
+        accessToken: String
+    ) async throws {
+        let tombstonedFonts = try parseCloudFonts(snapshotJSON).filter(\.isDeleted)
+        guard !tombstonedFonts.isEmpty else { return }
+        let filesByName = driveFilesByName(try await listDriveFiles(accessToken: accessToken))
+        for font in tombstonedFonts {
+            guard let driveFile = filesByName[font.safeFileName] ?? filesByName[font.fileName] else {
+                continue
+            }
+            try await deleteDriveFile(fileID: driveFile.id, accessToken: accessToken)
+            syncLogger.info("cloud_sync.font_deleted id=\(font.id, privacy: .public)")
+        }
+    }
+
+    private func resolveCloudBookPath(_ path: String) -> URL? {
+        if path.hasPrefix("Imports/") {
+            return try? cloudImportsDirectory()
+                .appendingPathComponent(String(path.dropFirst("Imports/".count)))
+        }
+        if path.hasPrefix("Documents/") {
+            return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+                .first?
+                .appendingPathComponent(String(path.dropFirst("Documents/".count)))
+        }
+        return path.hasPrefix("/") ? URL(fileURLWithPath: path) : nil
+    }
+
+    private func cloudImportsDirectory() throws -> URL {
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("Imports", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private static let driveDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let driveDateFormatterWithoutFractionalSeconds: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private func driveModifiedTimestamp(_ value: String?) -> Int64 {
+        guard let value else { return 0 }
+        let date = Self.driveDateFormatter.date(from: value)
+            ?? Self.driveDateFormatterWithoutFractionalSeconds.date(from: value)
+        return date.map { Int64($0.timeIntervalSince1970 * 1000) } ?? 0
+    }
+
+    private func driveFilesByName(_ files: [DriveFile]) -> [String: DriveFile] {
+        files.reduce(into: [:]) { result, file in
+            guard let existing = result[file.name] else {
+                result[file.name] = file
+                return
+            }
+            let existingDate = existing.modifiedTime
+                .flatMap(Self.driveDateFormatter.date(from:)) ?? .distantPast
+            let candidateDate = file.modifiedTime
+                .flatMap(Self.driveDateFormatter.date(from:)) ?? .distantPast
+            if candidateDate > existingDate {
+                result[file.name] = file
+            }
+        }
+    }
+
+    private func downloadDriveFile(fileID: String, accessToken: String) async throws -> Data {
+        var components = URLComponents(
+            string: "https://www.googleapis.com/drive/v3/files/\(fileID)"
+        )!
+        components.queryItems = [URLQueryItem(name: "alt", value: "media")]
+        return try await driveRequest(
+            url: components.url!,
+            method: "GET",
+            accessToken: accessToken
+        )
+    }
+
+    private func deleteDriveFile(fileID: String, accessToken: String) async throws {
+        let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(fileID)")!
+        _ = try await driveRequest(
+            url: url,
+            method: "DELETE",
+            accessToken: accessToken
+        )
+    }
+
+    private func uploadDriveFile(
+        _ content: Data,
+        name: String,
+        fileID: String?,
+        accessToken: String,
+        contentType: String = "application/octet-stream"
+    ) async throws -> DriveFile? {
+        if let fileID {
+            var components = URLComponents(
+                string: "https://www.googleapis.com/upload/drive/v3/files/\(fileID)"
+            )!
+            components.queryItems = [
+                URLQueryItem(name: "uploadType", value: "media"),
+                URLQueryItem(name: "fields", value: "id,name,modifiedTime"),
+            ]
+            let response = try await driveRequest(
+                url: components.url!,
+                method: "PATCH",
+                accessToken: accessToken,
+                contentType: contentType,
+                body: content
+            )
+            return try? JSONDecoder().decode(DriveFile.self, from: response)
+        }
+        let boundary = "EpistemeContent-\(UUID().uuidString)"
+        let metadata = "{\"name\":\(jsonString(name)),\"parents\":[\"appDataFolder\"]}"
+        var body = Data("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n\(metadata)\r\n".utf8)
+        body.append(Data("--\(boundary)\r\nContent-Type: \(contentType)\r\n\r\n".utf8))
+        body.append(content)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files")!
+        components.queryItems = [
+            URLQueryItem(name: "uploadType", value: "multipart"),
+            URLQueryItem(name: "fields", value: "id,name,modifiedTime"),
+        ]
+        let response = try await driveRequest(
+            url: components.url!,
+            method: "POST",
+            accessToken: accessToken,
+            contentType: "multipart/related; boundary=\(boundary)",
+            body: body
+        )
+        return try? JSONDecoder().decode(DriveFile.self, from: response)
+    }
+
+    private func jsonString(_ value: String) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: [value])
+        let encoded = data.flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
+        return String(encoded.dropFirst().dropLast())
+    }
+
+    private func driveRequest(
+        url: URL,
+        method: String,
+        accessToken: String,
+        contentType: String? = nil,
+        body: Data? = nil
+    ) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = body
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if let contentType {
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw CloudSyncError.requestFailed(status)
+        }
+        return data
+    }
+#endif
+
+    private enum CloudSyncError: LocalizedError {
+        case googleAuthorizationRequired
+        case firebaseAccountRequired
+        case firestoreUnavailable
+        case proRequired
+        case iCloudUnavailable
+        case cloudKitUnavailable(String)
+        case invalidSnapshot
+        case invalidDrivePageToken
+        case requestFailed(Int)
+        case sidecarPersistenceFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .googleAuthorizationRequired:
+                return "Google Drive authorization is required."
+            case .firebaseAccountRequired:
+                return "A Firebase account is required for metadata sync."
+            case .firestoreUnavailable:
+                return "Firestore is unavailable in this build."
+            case .proRequired:
+                return "iCloud sync is a Pro feature."
+            case .iCloudUnavailable:
+                return "Sign in to iCloud to enable sync."
+            case .cloudKitUnavailable(let detail):
+                return detail.isEmpty ? "iCloud sync is unavailable." : detail
+            case .invalidSnapshot:
+                return "The cloud snapshot is invalid."
+            case .invalidDrivePageToken:
+                return "Google Drive returned a repeated page token."
+            case .requestFailed(let status):
+                return "Google Drive returned HTTP \(status)."
+            case .sidecarPersistenceFailed(let bookId):
+                return "Could not persist PDF annotations for \(bookId)."
+            }
+        }
+    }
+
+    // MARK: - Pure CloudKit library sync (Pro, iOS-only)
+    // Full path requires CloudKit; stubs after the helpers report
+    // unavailable when the framework is missing (Drive path unaffected).
+
+#if canImport(CloudKit)
+    /// Diagnostics for each pass: `[cloudkit_sync]` everywhere so the exported
+    /// log can be filtered to this feature. Never logs book titles/paths, only
+    /// counts and IDs.
+    private func cloudKitLog(_ message: String) {
+        cloudKitLogger.info("cloudkit_sync.\(message, privacy: .public)")
+    }
+
+    /// Pull: upload local winners, fetch authoritative remote, download
+    /// missing payloads, hand merged snapshot to shared UI. Drive/Firestore
+    /// path below is untouched and dormant.
+    private func syncCloudKitSnapshot(localJSON: String) async {
+        // Short label so this pass's lines can be told apart when a push runs
+        // concurrently: both passes log to the same subsystem/category.
+        let passId = nextCloudKitPassId()
+        guard !cloudDataClearInFlight else {
+            cloudKitLog("pull_skip pass=\(passId) reason=clearing")
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud data is being cleared."
+            )
+            return
+        }
+        if cloudKitPullInFlight {
+            cloudKitLog("pull_coalesce pass=\(passId) reason=in_flight")
+            let previousAttempt = loadCloudSyncOutbox(.pull)?.attempt ?? 0
+            saveCloudSyncOutbox(snapshotJSON: localJSON, operation: .pull, previousAttempt: previousAttempt)
+            return
+        }
+        do {
+            try requireCloudKitPro()
+        } catch {
+            cloudKitLog("pull_skip pass=\(passId) reason=pro_required")
+            completeCloudKitGateFailure(error)
+            return
+        }
+        let preparedLocalJSON = preparedCloudSnapshot(localJSON)
+        let generation = cloudSyncGeneration
+        cloudKitPullInFlight = true
+        defer {
+            cloudKitPullInFlight = false
+            if loadCloudSyncOutbox(.pull) != nil { scheduleCloudSyncRetryIfNeeded() }
+        }
+        let startedAt = Date()
+        cloudKitLog("pull_start pass=\(passId) bytes=\(preparedLocalJSON.utf8.count) attempt=\(loadCloudSyncOutbox(.pull)?.attempt ?? 0)")
+        do {
+            try await cloudKitEnsureSession()
+            // Reads are incremental: the first fetch folds the delta since the
+            // persisted token into the on-disk remote shadow, and the shadow is
+            // written atomically with the new token so the two can never be
+            // torn. The original code re-enumerated the whole zone per pass and
+            // had to be careful not to consume a transient token twice, which
+            // is what once made a fresh device report 18 records fetched then
+            // `remoteBooks=0 downloadedBooks=0`.
+            var maps = try await cloudKitFetchMaps(passId: passId)
+            let uploaded = try await cloudKitUploadDirty(passId: passId, preparedLocalJSON: preparedLocalJSON, remoteMaps: maps)
+            guard generation == cloudSyncGeneration else { return }
+            // Re-read only if our own pass actually wrote anything. This now
+            // costs a delta sized to what we just wrote instead of a full
+            // enumeration, and it also picks up anything a concurrent device
+            // committed in the meantime.
+            if uploaded > 0 {
+                maps = try await cloudKitFetchMaps(passId: passId)
+            }
+            let remoteJSON = try cloudKitBuildRemoteJSON(preparedLocalJSON: preparedLocalJSON, maps: maps)
+            let downloaded = try await cloudKitDownloadMissingBooks(localJSON: preparedLocalJSON, maps: maps)
+            let downloadedFonts = try await cloudKitDownloadMissingFonts(localJSON: preparedLocalJSON, maps: maps)
+            let downloadedSidecars = try cloudKitMergeRemoteSidecars(localJSON: preparedLocalJSON, maps: maps)
+            guard generation == cloudSyncGeneration else { return }
+            let hydrated = injectPdfSidecars(
+                injectDownloadedFontPaths(remoteJSON, pathsByFontID: downloadedFonts),
+                sidecars: downloadedSidecars.map {
+                    CloudPdfSidecar(bookId: $0.bookId, timestamp: $0.timestamp, data: $0.data)
+                }
+            )
+            clearCloudSyncOutbox(.pull)
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            syncLogger.info(
+                "cloud_sync.pull_success backend=cloudkit bytes=\(preparedLocalJSON.utf8.count) remoteBytes=\(hydrated.utf8.count) books=\(downloaded.count) fonts=\(downloadedFonts.count) pdfSidecars=\(downloadedSidecars.count) elapsedMs=\(elapsedMs)"
+            )
+            cloudKitLog(
+                "pull_success pass=\(passId) remoteBooks=\(maps.states.count) tombstones=\(maps.tombstones.count) shelves=\(maps.shelves.count) fonts=\(maps.fonts.count) downloadedBooks=\(downloaded.count) downloadedFonts=\(downloadedFonts.count) sidecars=\(downloadedSidecars.count) uploaded=\(uploaded) elapsedMs=\(elapsedMs)"
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: hydrated,
+                downloadedBookIds: downloaded.map(\.id),
+                downloadedBookPaths: downloaded.map(\.path),
+                status: downloaded.isEmpty
+                    ? "Cloud reading progress downloaded."
+                    : "Downloaded \(downloaded.count) cloud book(s)."
+            )
+        } catch {
+            guard generation == cloudSyncGeneration else { return }
+            if isCloudKitGateError(error) {
+                cloudKitLog("pull_gate_failure pass=\(passId) error=\(safeCloudKitError(error))")
+                completeCloudKitGateFailure(error)
+                return
+            }
+            let previousAttempt = loadCloudSyncOutbox(.pull)?.attempt ?? 0
+            let quarantined = recordCloudSyncFailure(
+                operation: .pull,
+                snapshotJSON: preparedLocalJSON,
+                previousAttempt: previousAttempt,
+                error: error
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: quarantined ?? "iCloud sync failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// GPS-style error text for diagnostics; never includes payload data.
+    private func safeCloudKitError(_ error: Error) -> String {
+        let description = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        return description.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    /// Push: upload-only fast path (no downloads). Metadata-only passes never
+    /// stage assets; content passes stage only winning book/font files.
+    private func uploadMergedCloudKitSnapshot(_ snapshotJSON: String) async {
+        let passId = nextCloudKitPassId()
+        guard !cloudDataClearInFlight else {
+            cloudKitLog("push_skip pass=\(passId) reason=clearing")
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud data is being cleared."
+            )
+            return
+        }
+        if cloudKitPushInFlight {
+            cloudKitLog("push_coalesce pass=\(passId) reason=in_flight")
+            let previousAttempt = loadCloudSyncOutbox(.push)?.attempt ?? 0
+            saveCloudSyncOutbox(snapshotJSON: snapshotJSON, operation: .push, previousAttempt: previousAttempt)
+            return
+        }
+        do {
+            try requireCloudKitPro()
+        } catch {
+            cloudKitLog("push_skip pass=\(passId) reason=pro_required")
+            completeCloudKitGateFailure(error)
+            return
+        }
+        let preparedSnapshotJSON = preparedCloudSnapshot(snapshotJSON)
+        let generation = cloudSyncGeneration
+        cloudKitPushInFlight = true
+        defer {
+            cloudKitPushInFlight = false
+            if loadCloudSyncOutbox(.push) != nil { scheduleCloudSyncRetryIfNeeded() }
+        }
+        let startedAt = Date()
+        cloudKitLog("push_start pass=\(passId) bytes=\(preparedSnapshotJSON.utf8.count)")
+        do {
+            try await cloudKitEnsureSession()
+            let maps = try await cloudKitFetchMaps(passId: passId)
+            let wrote = try await cloudKitUploadDirty(passId: passId, preparedLocalJSON: preparedSnapshotJSON, remoteMaps: maps)
+            guard generation == cloudSyncGeneration else { return }
+            clearCloudSyncOutbox(.push)
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            syncLogger.info(
+                "cloud_sync.push_success backend=cloudkit bytes=\(preparedSnapshotJSON.utf8.count) wrote=\(wrote) elapsedMs=\(elapsedMs)"
+            )
+            cloudKitLog("push_success pass=\(passId) wrote=\(wrote) elapsedMs=\(elapsedMs)")
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: "Cloud reading progress is up to date."
+            )
+        } catch {
+            guard generation == cloudSyncGeneration else { return }
+            if isCloudKitGateError(error) {
+                cloudKitLog("push_gate_failure pass=\(passId) error=\(safeCloudKitError(error))")
+                completeCloudKitGateFailure(error)
+                return
+            }
+            let previousAttempt = loadCloudSyncOutbox(.push)?.attempt ?? 0
+            let quarantined = recordCloudSyncFailure(
+                operation: .push,
+                snapshotJSON: preparedSnapshotJSON,
+                previousAttempt: previousAttempt,
+                error: error
+            )
+            bridge?.completeCloudSync(
+                remoteSnapshotJson: nil,
+                downloadedBookIds: [],
+                downloadedBookPaths: [],
+                status: quarantined ?? "iCloud upload failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func isCloudKitGateError(_ error: Error) -> Bool {
+        if let syncError = error as? CloudSyncError {
+            switch syncError {
+            case .proRequired, .iCloudUnavailable: return true
+            default: return false
+            }
+        }
+#if canImport(CloudKit)
+        if let transportError = error as? CloudKitLibraryTransport.TransportError {
+            switch transportError {
+            case .deterministic(let detail):
+                return detail.localizedCaseInsensitiveContains("iCloud account")
+                    || detail.localizedCaseInsensitiveContains("not available")
+            default: return false
+            }
+        }
+#endif
+        return false
+    }
+
+    private struct CloudKitRemoteMaps {
+        var states: [String: [String: Any]] = [:]
+        var contentModified: [String: Int64] = [:]
+        var sidecars: [String: (timestamp: Int64, data: String)] = [:]
+        var tombstones: [String: Int64] = [:]
+                var shelves: [String: [String: Any]] = [:]
+        var fonts: [String: [String: Any]] = [:]
+        /// IDs with an existing `FontContent` record (query results never
+        /// carry asset bytes, so only presence is derivable).
+        var fontContentIds: Set<String> = []
+    }
+
+    /// Pro + iCloud + zone gates shared by pull and push.
+    private func cloudKitEnsureSession() async throws {
+        try requireCloudKitPro()
+        do {
+            try await cloudKitTransport.requireAccount()
+        } catch {
+            throw CloudSyncError.iCloudUnavailable
+        }
+        if try await cloudKitTransport.checkUserRotation() {
+            cloudKitLog("account_rotation_detected action=reset_outbox")
+            clearCloudSyncOutbox()
+            // A zone change token is only meaningful to the private database
+            // that issued it. After an Apple-ID switch the new account has a
+            // different zone, so reusing the old token would either fail or
+            // (worse) silently resolve against the wrong silo.
+            clearCloudKitBaseline()
+            cloudKitSubscriptionEnsured = false
+        }
+        try await cloudKitTransport.ensureZone()
+        if !cloudKitSubscriptionEnsured {
+            // Best-effort: push wakeups are an optimization, the full query
+            // per pass is the source of truth. Never fail a sync on this.
+            try? await cloudKitTransport.ensureSubscription()
+            cloudKitSubscriptionEnsured = true
+        }
+    }
+
+    /// Full authoritative read of the library zone (no persisted delta; a
+    /// token consumed by an earlier fetch in the same pass was the reason a
+    /// fresh device observed zero remote records). `CKAsset.fileURL` is nil on
+    /// query results, so content/fonts download lazily via the transport.
+    /// The remote shadow: last-known CloudKit state for the whole zone, kept on
+    /// disk so LWW can compare local against *remote* without re-reading the
+    /// zone from the network on every pass. The zone server change token is
+    /// stored in the same file, because the two are only valid together.
+    private static let cloudKitBaselineFileName = "reader.ios.cloudkit.remoteBaseline.v1.json"
+    private static let cloudKitBaselineVersion = 1
+
+    private struct CloudKitBaseline {
+        var token: String?
+        var maps: CloudKitRemoteMaps
+    }
+
+    private var cloudKitBaselineURL: URL? {
+        guard let directory = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return nil }
+        return directory.appendingPathComponent(Self.cloudKitBaselineFileName)
+    }
+
+    private func loadCloudKitBaseline() -> CloudKitBaseline? {
+        guard let url = cloudKitBaselineURL,
+              let data = try? Data(contentsOf: url),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              (root["version"] as? Int) == Self.cloudKitBaselineVersion else { return nil }
+        return CloudKitBaseline(
+            token: root["token"] as? String,
+            maps: Self.decodeCloudKitMaps(root)
+        )
+    }
+
+    private func saveCloudKitBaseline(_ baseline: CloudKitBaseline) {
+        guard let url = cloudKitBaselineURL else { return }
+        var root: [String: Any] = ["version": Self.cloudKitBaselineVersion]
+        root["token"] = baseline.token ?? NSNull()
+        Self.encodeCloudKitMaps(baseline.maps, into: &root)
+        do {
+            let data = try JSONSerialization.data(withJSONObject: root)
+            // Atomic: a torn write here would advance the token without the
+            // matching shadow and silently skip a delta.
+            try data.write(to: url, options: .atomic)
+        } catch {
+            // Losing the shadow only costs one full re-read next pass, so this
+            // must not fail the pass.
+            cloudKitLog("baseline_save_failed error=\(safeCloudKitError(error))")
+        }
+    }
+
+    private func clearCloudKitBaseline() {
+        guard let url = cloudKitBaselineURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private static func encodeCloudKitMaps(_ maps: CloudKitRemoteMaps, into root: inout [String: Any]) {
+        root["states"] = maps.states
+        root["shelves"] = maps.shelves
+        root["fonts"] = maps.fonts
+        root["contentModified"] = maps.contentModified.mapValues { NSNumber(value: $0) }
+        root["tombstones"] = maps.tombstones.mapValues { NSNumber(value: $0) }
+        root["sidecars"] = maps.sidecars.mapValues {
+            ["timestamp": NSNumber(value: $0.timestamp), "data": $0.data]
+        }
+        root["fontContentIds"] = Array(maps.fontContentIds)
+    }
+
+    private static func decodeCloudKitMaps(_ root: [String: Any]) -> CloudKitRemoteMaps {
+        var maps = CloudKitRemoteMaps()
+        maps.states = (root["states"] as? [String: [String: Any]]) ?? [:]
+        maps.shelves = (root["shelves"] as? [String: [String: Any]]) ?? [:]
+        maps.fonts = (root["fonts"] as? [String: [String: Any]]) ?? [:]
+        maps.contentModified = (root["contentModified"] as? [String: NSNumber])?
+            .mapValues(\.int64Value) ?? [:]
+        maps.tombstones = (root["tombstones"] as? [String: NSNumber])?
+            .mapValues(\.int64Value) ?? [:]
+        maps.sidecars = (root["sidecars"] as? [String: [String: Any]])?.reduce(into: [:]) { result, entry in
+            guard let data = entry.value["data"] as? String else { return }
+            result[entry.key] = (
+                timestamp: (entry.value["timestamp"] as? NSNumber)?.int64Value ?? 0,
+                data: data
+            )
+        } ?? [:]
+        maps.fontContentIds = Set((root["fontContentIds"] as? [String]) ?? [])
+        return maps
+    }
+
+    /// Serializes every zone read that mutates the on-disk shadow.
+    ///
+    /// Pull and push are allowed to run concurrently (Android runs them as
+    /// separate WorkManager jobs), but they share one shadow file and one zone
+    /// change token. Two overlapping refreshes could each load the shadow, apply
+    /// their own delta, and save; if the pass holding the *older* shadow wrote
+    /// last, its token would mark records as seen that its shadow never
+    /// absorbed, and those records would be skipped forever. Serializing here
+    /// means the second caller re-reads the shadow the first one wrote instead
+    /// of starting from a stale load.
+    private let cloudKitBaselineLock = AsyncMutex()
+
+    /// Serializes every CloudKit write (record saves and tombstoned-content
+    /// reclaims) across pull and push. Held only for the duration of the write
+    /// calls, never across a zone fetch, so it cannot serialize whole passes.
+    private let cloudKitWriteLock = AsyncMutex()
+
+    /// Monotonic pass label (`p1`, `p2`, …) for log correlation. Pull and push
+    /// can overlap and they share one OSLog category, so without this an
+    /// interleaved read of a sync window cannot be attributed to a pass.
+    private var cloudKitPassCounter = 0
+
+    private func nextCloudKitPassId() -> String {
+        cloudKitPassCounter += 1
+        return "p\(cloudKitPassCounter)"
+    }
+
+    /// Remote state for the whole zone, refreshed from a delta read.
+    ///
+    /// On a cold start (no shadow, or an unusable token) this is a full
+    /// enumeration and the shadow is rebuilt. Steady state is one empty round
+    /// trip, and the cost is proportional to what actually changed.
+    ///
+    /// `passId` is a short label for the calling pass so its log lines can be
+    /// told apart when pull and push interleave.
+    private func cloudKitFetchMaps(passId: String) async throws -> CloudKitRemoteMaps {
+        try await cloudKitBaselineLock.withLock {
+            let baseline = loadCloudKitBaseline()
+            let storedToken = cloudKitTransport.unarchiveChangeToken(baseline?.token)
+            // A token and a shadow are only valid together; a half-written pair
+            // is indistinguishable from neither, and both mean "re-read the zone".
+            let canResume = storedToken != nil
+            let delta = try await cloudKitTransport.fetchZoneChanges(since: canResume ? storedToken : nil)
+
+            var maps = delta.isFullSnapshot ? CloudKitRemoteMaps() : (baseline?.maps ?? CloudKitRemoteMaps())
+            for record in delta.records {
+                cloudKitAccumulate(record: record, maps: &maps)
+            }
+            for id in delta.deletedRecordIDs {
+                cloudKitForgetDeleted(id, maps: &maps)
+            }
+            // Legacy cleanup (Pride_and_Prejudice.epub and siblings): older
+            // builds used a device-local absolute path as the book id. Those
+            // records can never be downloaded — the pull guard refuses them
+            // every pass (`book_undownloadable reason=invalid_id`) — and can
+            // never match a local book, so they are dead weight in both the
+            // zone and the shadow. The shadow holds them even though the
+            // record itself rarely reappears in deltas, which is why the log
+            // spam never stopped: the download loop iterates the shadow.
+            //
+            // Scrub them from the shadow and delete the zone records directly
+            // by constructed name. Only ids failing the exact validation the
+            // download guard uses are touched; a valid content-hash or
+            // `ios_import_*` id can never fail it, so valid records are not
+            // deletion candidates. Deleting a name that does not exist reports
+            // unknownItem, which counts as success.
+            let legacyIds = cloudKitLegacyEntityIds(in: maps)
+            if !legacyIds.isEmpty {
+                var legacyRecordIDs: [CKRecord.ID] = []
+                for entityId in legacyIds {
+                    for recordType in [
+                        CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_STATE,
+                        CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_CONTENT,
+                        CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE,
+                    ] {
+                        legacyRecordIDs.append(CKRecord.ID(
+                            recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                                recordType: recordType, id: entityId
+                            ),
+                            zoneID: cloudKitTransport.zoneID
+                        ))
+                    }
+                }
+                cloudKitLog(
+                    "legacy_record_cleanup count=\(legacyIds.count) "
+                        + "ids=\(legacyIds.map { String($0.suffix(48)) }.joined(separator: ","))"
+                )
+                // Throw on failure so the token below is not saved past
+                // records we failed to remove; the pass retries via the
+                // outbox and deletes are idempotent.
+                try await cloudKitTransport.deleteRecordIDs(legacyRecordIDs)
+                cloudKitScrubLegacyEntityIds(legacyIds, maps: &maps)
+            }
+            // Records that DO appear in this delta but carry an unusable
+            // entity id (field-less records, sidecars whose zone name cannot
+            // be constructed locally): delete by their actual record ID.
+            let legacyDeltaIDs = delta.records.compactMap { record -> CKRecord.ID? in
+                guard let entityId = cloudKitCleanupEntityId(record) else { return nil }
+                guard !CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: entityId) else { return nil }
+                return record.recordID
+            }
+            if !legacyDeltaIDs.isEmpty {
+                cloudKitLog("legacy_record_cleanup_delta count=\(legacyDeltaIDs.count)")
+                try await cloudKitTransport.deleteRecordIDs(legacyDeltaIDs)
+            }
+            let nextBaseline = CloudKitBaseline(
+                token: cloudKitTransport.archiveChangeToken(delta.token),
+                maps: maps
+            )
+            saveCloudKitBaseline(nextBaseline)
+            cloudKitLog(
+                "baseline_refreshed pass=\(passId) records=\(delta.records.count) deleted=\(delta.deletedRecordIDs.count) "
+                    + "full=\(delta.isFullSnapshot) resumed=\(canResume) "
+                    + "states=\(maps.states.count) tombstones=\(maps.tombstones.count) shelves=\(maps.shelves.count) fonts=\(maps.fonts.count)"
+            )
+            return maps
+        }
+    }
+
+    /// Drop a deleted record from the shadow. Record names are
+    /// `"<Type>:<id>"` (shared `cloudKitLibraryRecordName`) and type names never
+    /// contain a colon, so the split is delegated to shared
+    /// `cloudKitSplitLibraryRecordName` rather than reimplemented here — entity
+    /// ids may contain colons (isbn-style ids) and only shared knows the format
+    /// is defined that way.
+    private func cloudKitForgetDeleted(_ id: CKRecord.ID, maps: inout CloudKitRemoteMaps) {
+        guard let parts = CloudKitLibrarySyncKt.cloudKitSplitLibraryRecordName(
+            recordName: id.recordName
+        ) else { return }
+        let type = parts.recordType as String
+        let entityId = parts.id as String
+        switch type {
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_STATE,
+             CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE:
+            // A tombstone is a BookState-shaped record, so deleting either can
+            // invalidate both entries for the same book.
+            maps.states.removeValue(forKey: entityId)
+            maps.tombstones.removeValue(forKey: entityId)
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_CONTENT:
+            maps.contentModified.removeValue(forKey: entityId)
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_PDF_SIDECAR:
+            maps.sidecars.removeValue(forKey: entityId)
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_SHELF:
+            maps.shelves.removeValue(forKey: entityId)
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_META:
+            maps.fonts.removeValue(forKey: entityId)
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_CONTENT:
+            maps.fontContentIds.remove(entityId)
+        default:
+            break
+        }
+    }
+
+    /// Entity ids in the shadow that can never be valid book ids: legacy
+    /// device-local absolute paths from older builds. Union over every
+    /// book-keyed map. Anything returned here is deleted from the zone and
+    /// scrubbed from the shadow by the caller in `cloudKitFetchMaps`.
+    private func cloudKitLegacyEntityIds(in maps: CloudKitRemoteMaps) -> [String] {
+        var ids = Set<String>()
+        for id in maps.states.keys
+            where !CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: id) {
+            ids.insert(id)
+        }
+        for id in maps.tombstones.keys
+            where !CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: id) {
+            ids.insert(id)
+        }
+        for id in maps.contentModified.keys
+            where !CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: id) {
+            ids.insert(id)
+        }
+        for id in maps.sidecars.keys
+            where !CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: id) {
+            ids.insert(id)
+        }
+        return ids.sorted()
+    }
+
+    private func cloudKitScrubLegacyEntityIds(_ ids: [String], maps: inout CloudKitRemoteMaps) {
+        for id in ids {
+            maps.states.removeValue(forKey: id)
+            maps.tombstones.removeValue(forKey: id)
+            maps.contentModified.removeValue(forKey: id)
+            maps.sidecars.removeValue(forKey: id)
+        }
+    }
+
+    /// The entity id a fetched record claims, for legacy cleanup. Prefers the
+    /// `bookId` field — the same value `cloudKitAccumulate` keys the shadow
+    /// by — falling back to the record-name id part for field-less records.
+    /// Returns nil for record types the cleanup does not own.
+    private func cloudKitCleanupEntityId(_ record: CKRecord) -> String? {
+        switch record.recordType {
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_STATE,
+             CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_CONTENT,
+             CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE,
+             CloudKitLibrarySyncKt.CLOUDKIT_RECORD_PDF_SIDECAR:
+            break
+        default:
+            return nil
+        }
+        let fields = cloudKitTransport.recordFields(record)
+        if let bookId = fields["bookId"] as? String, !bookId.isEmpty {
+            return bookId
+        }
+        return CloudKitLibrarySyncKt.cloudKitSplitLibraryRecordName(
+            recordName: record.recordID.recordName
+        )?.id as String?
+    }
+    private func cloudKitAccumulate(record: CKRecord, maps: inout CloudKitRemoteMaps) {        let fields = cloudKitTransport.recordFields(record)
+        switch record.recordType {
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_STATE:
+            guard let bookId = fields["bookId"] as? String, !bookId.isEmpty else { return }
+            // Legacy path-id records must not poison the shadow while awaiting
+            // deletion (see legacy cleanup in `cloudKitFetchMaps`). A valid id
+            // can never fail this check.
+            guard CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: bookId) else { return }
+            if (fields["isDeleted"] as? NSNumber)?.boolValue == true {
+                maps.tombstones[bookId] = max(
+                    maps.tombstones[bookId] ?? 0,
+                    (fields["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+                )
+                maps.states.removeValue(forKey: bookId)
+            } else {
+                maps.states[bookId] = fields
+            }
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_CONTENT:
+            guard let bookId = fields["bookId"] as? String, !bookId.isEmpty else { return }
+            guard CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: bookId) else { return }
+            // Query results never carry asset bytes; only the content clock
+            // is available here. Bytes download lazily by record name.
+            maps.contentModified[bookId] = (fields["fileContentModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_PDF_SIDECAR:
+            guard let bookId = fields["bookId"] as? String,
+                  let data = fields["data"] as? String, !data.isEmpty else { return }
+            guard CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: bookId) else { return }
+            let timestamp = (fields["timestamp"] as? NSNumber)?.int64Value ?? 0
+            if timestamp >= (maps.sidecars[bookId]?.timestamp ?? -1) {
+                maps.sidecars[bookId] = (timestamp, data)
+            }
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE:
+            guard let bookId = fields["bookId"] as? String else { return }
+            guard bookId.isEmpty || CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: bookId) else { return }
+            maps.tombstones[bookId] = max(
+                maps.tombstones[bookId] ?? 0,
+                (fields["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+            )
+            maps.states.removeValue(forKey: bookId)
+                case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_SHELF:
+            guard let shelfId = fields["shelfId"] as? String, !shelfId.isEmpty else { return }
+            maps.shelves[shelfId] = fields
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_META:
+            guard let fontId = fields["id"] as? String, !fontId.isEmpty else { return }
+            maps.fonts[fontId] = fields
+        case CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_CONTENT:
+            guard let fontId = fields["id"] as? String, !fontId.isEmpty else { return }
+            // Presence only: a font's `FontContent` record existing means its
+            // bytes can be downloaded lazily by record name.
+            maps.fontContentIds.insert(fontId)
+        default:
+            break
+        }
+    }
+
+    /// Dynamic upload: metadata/sidecar/content/tombstone/font sets computed
+    /// from shared LWW clocks against a freshly fetched remote snapshot. The
+    /// caller passes the maps so the pull path can reuse the same fetch; an
+    /// earlier version did its own delta fetch and the persisted token was
+    /// then consumed a second time by the pull's `cloudKitFetchMaps`, leaving
+    /// `remoteBooks=0` on a fresh device.
+    ///
+    /// Content clock comes from the real local file mtime, not the snapshot's
+    /// `fileContentModifiedTimestamp`: iOS imports leave that field at 0 and
+    /// the Drive path already reads the file (see `uploadCloudBookContents`).
+    /// Returns `records.count` (all writes, not just sidecars) so pull/push
+    /// can decide whether a re-fetch is needed.
+    @discardableResult
+    private func cloudKitUploadDirty(
+        passId: String,
+        preparedLocalJSON: String,
+        remoteMaps: CloudKitRemoteMaps
+    ) async throws -> Int {
+        let maps = remoteMaps
+        let localBooks = CloudKitLibraryMapper.parseBooks(preparedLocalJSON)
+        let syncable = localBooks.filter { cloudKitBookIsSyncable($0) }
+        let localSidecarTs: [String: Int64] = Dictionary(
+            uniqueKeysWithValues: pdfSidecarsFromSnapshot(preparedLocalJSON).map { ($0.bookId, $0.timestamp) }
+        )
+        var availability: [String: Bool] = [:]
+        var localURLById: [String: URL] = [:]
+        var localFileMtimeById: [String: Int64] = [:]
+        for book in syncable {
+            guard let bookId = book["id"] as? String else { continue }
+            if let path = book["path"] as? String,
+               let url = resolveCloudBookPath(path),
+               FileManager.default.fileExists(atPath: url.path) {
+                availability[bookId] = true
+                localURLById[bookId] = url
+                let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))
+                    .flatMap { $0.contentModificationDate?.timeIntervalSince1970 }
+                    ?? (Double((book["timestamp"] as? NSNumber)?.doubleValue ?? 0) / 1000)
+                localFileMtimeById[bookId] = Int64(mtime * 1000)
+            } else {
+                availability[bookId] = false
+            }
+        }
+        let dirty = CloudKitLibraryMapper.classifyDirty(
+            localBooks: syncable,
+            remoteStateById: maps.states,
+            remoteContentModifiedById: maps.contentModified,
+            localSidecarTimestampById: localSidecarTs,
+            localFileAvailableById: availability,
+            localContentTimestampById: localFileMtimeById
+        )
+        cloudKitLog(
+            "dirty_sets pass=\(passId) metadata=\(dirty.metadataBookIds.count) sidecars=\(dirty.sidecarBookIds.count) content=\(dirty.contentBookIds.count) localBooks=\(syncable.count) localFilesAvailable=\(availability.values.filter { $0 }.count)"
+        )
+        let deviceId = cloudSyncDeviceID()
+        var records: [CKRecord] = []
+        for bookId in dirty.metadataBookIds {
+            guard let book = syncable.first(where: { ($0["id"] as? String) == bookId }) else { continue }
+            let fields = CloudKitLibraryMapper.bookStateFields(
+                book: book,
+                sidecarTimestamp: localSidecarTs[bookId] ?? 0,
+                fileContentTimestamp: localFileMtimeById[bookId] ?? 0,
+                deviceId: deviceId
+            )
+            records.append(cloudKitTransport.stateRecord(
+                recordName: CloudKitLibrarySyncKt.cloudKitBookStateRecordName(bookId: bookId),
+                fields: fields
+            ))
+        }
+        for bookId in dirty.sidecarBookIds {
+            guard let data = localPdfSidecar(bookId: bookId)?.data ??
+                    pdfSidecarsFromSnapshot(preparedLocalJSON).first(where: { $0.bookId == bookId })?.data,
+                  !data.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let timestamp = max(
+                localSidecarTs[bookId] ?? 0,
+                (syncable.first(where: { ($0["id"] as? String) == bookId })
+                    .flatMap { ($0["annotationModifiedTimestamp"] as? NSNumber)?.int64Value } ?? 0)
+            )
+            records.append(cloudKitTransport.genericRecord(
+                recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_PDF_SIDECAR,
+                recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                    recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_PDF_SIDECAR, id: bookId
+                ),
+                fields: ["bookId": bookId, "timestamp": timestamp, "data": data]
+            ))
+        }
+        for bookId in dirty.contentBookIds {
+            guard let localURL = localURLById[bookId],
+                  let contentTs = localFileMtimeById[bookId] else { continue }
+            records.append(cloudKitTransport.contentRecord(
+                recordName: CloudKitLibrarySyncKt.cloudKitBookContentRecordName(bookId: bookId),
+                fields: [
+                    "bookId": bookId,
+                    "fileContentModifiedTimestamp": contentTs,
+                    "originDeviceId": deviceId,
+                ],
+                assetURL: localURL
+            ))
+        }
+        // Tombstones publish only when the remote tombstone is missing or the
+        // local deletion is strictly newer. The previous comparison used the
+        // remote BookState clock, but a deleted book has no BookState, so every
+        // pass re-published every tombstone (the repeating `BookTombstone`
+        // entries in the save logs).
+        // Content records to reclaim once the tombstone that authorizes the
+        // delete is durably stored. Android publishes the tombstone first and
+        // only then removes the payload (CloudBookDeleteWorker:122-139 writes
+        // the tombstone, :181-191 deletes the Drive file). Reclaiming the
+        // content record first loses the delete entirely if the process dies in
+        // between: the bytes are gone but no tombstone exists, so no other
+        // device ever learns the book was removed.
+        var contentRecordsToReclaim: [CKRecord.ID] = []
+        for tombstone in CloudKitLibraryMapper.parseTombstones(preparedLocalJSON) {
+            guard let bookId = tombstone["bookId"] as? String, !bookId.isEmpty else { continue }
+            let deletedAt = (tombstone["deletedAt"] as? NSNumber)?.int64Value ?? 0
+            let remoteTombstone = maps.tombstones[bookId]
+            guard CloudKitLibrarySyncKt.shouldPublishCloudKitTombstone(
+                localDeletedAt: deletedAt,
+                remoteTombstoneClock: remoteTombstone.map { KotlinLong(longLong: $0) }
+            ) else { continue }
+            records.append(cloudKitTransport.genericRecord(
+                recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE,
+                recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                    recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_BOOK_TOMBSTONE, id: bookId
+                ),
+                fields: CloudKitLibraryMapper.tombstoneFields(
+                    bookId: bookId,
+                    deletedAt: deletedAt,
+                    type: tombstone["type"] as? String,
+                    deviceId: deviceId
+                )
+            ))
+            // Deleting the content record reclaims the asset; the tombstone
+            // record remains the authoritative delete marker.
+            if maps.contentModified[bookId] != nil {
+                contentRecordsToReclaim.append(CKRecord.ID(
+                    recordName: CloudKitLibrarySyncKt.cloudKitBookContentRecordName(bookId: bookId),
+                    zoneID: cloudKitTransport.zoneID
+                ))
+            }
+        }
+        try await cloudKitUploadFontDirty(preparedLocalJSON: preparedLocalJSON, maps: maps, records: &records)
+        cloudKitUploadShelfDirty(preparedLocalJSON: preparedLocalJSON, maps: maps, records: &records)
+        // Every CloudKit mutation goes through one lock. Pull and push are
+        // independent passes on purpose (a push must not queue behind a long
+        // pull), but both end in cloudKitUploadDirty and both write the same
+        // BookState records. Two concurrent modifyRecords calls for one record
+        // make CloudKit reject the whole batch - the log showed
+        // `save_record_failed record=BookState:<id> error=Atomic failure`,
+        // which failed a pull, surfaced "iCloud sync failed", and burned a retry
+        // cycle before recovering. Android serializes the same work with
+        // CloudBookSyncBarrier.withAccountLock(accountId).
+        //
+        // Only the writes are locked. Fetching and dirty classification stay
+        // outside, so a long pull still cannot stop a push from starting, and
+        // re-reading the zone is idempotent, so a slightly stale
+        // classification just re-sends the same local winner.
+        try await cloudKitWriteLock.withLock {
+            var start = records.startIndex
+            while start < records.endIndex {
+                let end = records.index(start, offsetBy: 300, limitedBy: records.endIndex) ?? records.endIndex
+                try await cloudKitTransport.saveRecords(Array(records[start..<end]))
+                start = end
+            }
+            if !contentRecordsToReclaim.isEmpty {
+                // A failure here only delays asset reclamation; the tombstone is
+                // already durable and a later pass retries.
+                try? await cloudKitTransport.deleteRecordIDs(contentRecordsToReclaim)
+            }
+        }
+        return records.count
+    }
+
+    private func cloudKitUploadFontDirty(
+        preparedLocalJSON: String,
+        maps: CloudKitRemoteMaps,
+        records: inout [CKRecord]
+    ) async throws {
+        let localFonts: [[String: Any]] = {
+            guard let data = preparedLocalJSON.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+            return root["customFonts"] as? [[String: Any]] ?? []
+        }()
+        let deviceId = cloudSyncDeviceID()
+        for font in localFonts {
+            guard let fontId = font["id"] as? String, !fontId.isEmpty else { continue }
+            let localTs = (font["timestamp"] as? NSNumber)?.int64Value ?? 0
+            let remoteTs = (maps.fonts[fontId]?["timestamp"] as? NSNumber)?.int64Value ?? 0
+            guard maps.fonts[fontId] == nil || CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                localModifiedTimestamp: localTs,
+                remoteModifiedTimestamp: remoteTs,
+                localSidecarModifiedTimestamp: 0
+            ) else { continue }
+            let isDeleted = font["isDeleted"] as? Bool ?? false
+            records.append(cloudKitTransport.genericRecord(
+                recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_META,
+                recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                    recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_META, id: fontId
+                ),
+                fields: [
+                    "id": fontId,
+                    "displayName": font["displayName"] as? String ?? fontId,
+                    "fileName": font["fileName"] as? String ?? "",
+                    "fileExtension": font["fileExtension"] as? String ?? "",
+                    "timestamp": localTs,
+                    "isDeleted": isDeleted,
+                    "originDeviceId": deviceId,
+                ]
+            ))
+            if isDeleted {
+                if maps.fontContentIds.contains(fontId) {
+                    try? await cloudKitTransport.deleteRecordIDs([CKRecord.ID(
+                        recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                            recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_CONTENT, id: fontId
+                        ),
+                        zoneID: cloudKitTransport.zoneID
+                    )])
+                }
+                continue
+            }
+            if let path = font["path"] as? String,
+               !path.isEmpty,
+               FileManager.default.fileExists(atPath: path) {
+                records.append(cloudKitTransport.genericRecord(
+                    recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_CONTENT,
+                    recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                        recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_FONT_CONTENT, id: fontId
+                    ),
+                    fields: ["id": fontId, "timestamp": localTs]
+                ))
+                // Attach the asset through a content-style record: reuse the
+                // generic record then set the asset key before save.
+                if let index = records.indices.last {
+                    records[index]["contentAsset"] = CKAsset(fileURL: URL(fileURLWithPath: path))
+                }
+            }
+        }
+    }
+
+    /// Shelf metadata uses the same shared LWW clock as books. Uploads carry
+    /// the member book IDs inline (small); refs keep local `addedAt` clocks.
+    private func cloudKitUploadShelfDirty(
+        preparedLocalJSON: String,
+        maps: CloudKitRemoteMaps,
+        records: inout [CKRecord]
+    ) {
+        guard let data = preparedLocalJSON.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        let localRecords = root["shelves"] as? [[String: Any]] ?? []
+        let localRefs = root["bookShelfRefs"] as? [[String: Any]] ?? []
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let deviceId = cloudSyncDeviceID()
+        for local in localRecords {
+            guard let shelfId = local["id"] as? String, !shelfId.isEmpty,
+                  (local["isSmart"] as? Bool ?? false) == false else { continue }
+            let localClock = (local["modifiedAt"] as? NSNumber)?.int64Value ?? 0
+            let remoteClock = (maps.shelves[shelfId]?["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+            let shouldUpload = maps.shelves[shelfId] == nil ||
+                (localClock > 0 && CloudSyncDecisionsKt.shouldUploadLocalCloudBookUpdate(
+                    localModifiedTimestamp: localClock,
+                    remoteModifiedTimestamp: remoteClock,
+                    localSidecarModifiedTimestamp: 0
+                ))
+            guard shouldUpload else { continue }
+            let clock = localClock > 0 ? localClock : max(now, remoteClock + 1)
+            let bookIds = localRefs.compactMap { ref -> String? in
+                guard (ref["shelfId"] as? String) == shelfId,
+                      let bookId = ref["bookId"] as? String else { return nil }
+                return bookId
+            }
+            records.append(cloudKitTransport.genericRecord(
+                recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_SHELF,
+                recordName: CloudKitLibrarySyncKt.cloudKitLibraryRecordName(
+                    recordType: CloudKitLibrarySyncKt.CLOUDKIT_RECORD_SHELF, id: shelfId
+                ),
+                fields: [
+                    "shelfId": shelfId,
+                    "name": local["name"] as? String ?? shelfId,
+                    "bookIds": bookIds,
+                    "lastModifiedTimestamp": clock,
+                    "isDeleted": local["isDeleted"] as? Bool ?? false,
+                    "originDeviceId": deviceId,
+                ]
+            ))
+        }
+    }
+
+    private func cloudKitBookIsSyncable(_ book: [String: Any]) -> Bool {
+        if !((book["sourceFolder"] is NSNull) || book["sourceFolder"] == nil) { return false }
+        if let path = book["path"] as? String, path.hasPrefix("opds-pse://") { return false }
+        guard let displayName = book["displayName"] as? String else { return false }
+        // A device-local absolute path as the book id produces a CloudKit record
+        // name the server rejects on every pass, so the book silently never
+        // syncs. Refuse it up front and say which book, instead. Android reaches
+        // the same conclusion by gating on a non-null cloud filename
+        // (sharedCloudBookContentFileName).
+        let id = book["id"] as? String ?? ""
+        let validId = CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: id)
+        if !validId {
+            cloudKitLog("book_unsyncable reason=invalid_id displayName=\(displayName)")
+        }
+        guard validId else { return false }
+        return !CloudBook.manualOnlyExtensions.contains(
+            URL(fileURLWithPath: displayName).pathExtension.lowercased()
+        )
+    }
+
+    /// Build the remote snapshot JSON from authoritative record maps. Books
+    /// mirror `snapshotBook(fromFirestore:)` so shared merge sees identical
+    /// shapes regardless of backend.
+    private func cloudKitBuildRemoteJSON(
+        preparedLocalJSON: String,
+        maps: CloudKitRemoteMaps
+    ) throws -> String {
+        guard let data = preparedLocalJSON.data(using: .utf8),
+              var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CloudSyncError.invalidSnapshot
+        }
+        var books: [[String: Any]] = []
+        for (_, fields) in maps.states {
+            if let book = snapshotBook(fromCloudKit: fields) { books.append(book) }
+        }
+        root["books"] = books
+        root["bookTombstones"] = maps.tombstones.map { (bookId, deletedAt) -> [String: Any] in
+            var tombstone: [String: Any] = ["bookId": bookId, "deletedAt": deletedAt]
+            tombstone["type"] = maps.states[bookId]?["type"] ?? NSNull()
+            return tombstone
+        }
+        root["pdfSidecars"] = []
+        // Shelves rebuild from authoritative records (same append-only ref
+        // rule as Firestore: newest addedAt per pair, local clocks preserved
+        // for surviving pairs).
+        let localRefsByShelf: [String: [[String: Any]]] = {
+            let refs = root["bookShelfRefs"] as? [[String: Any]] ?? []
+            return Dictionary(grouping: refs) { $0["shelfId"] as? String ?? "" }
+        }()
+        var mergedRecords: [[String: Any]] = []
+        var mergedRefs: [[String: Any]] = []
+        for fields in maps.shelves.values {
+            guard let shelfId = fields["shelfId"] as? String, !shelfId.isEmpty else { continue }
+            let isDeleted = (fields["isDeleted"] as? NSNumber)?.boolValue ?? false
+            let clock = (fields["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+            mergedRecords.append([
+                "id": shelfId,
+                "name": fields["name"] as? String ?? shelfId,
+                "isSmart": false,
+                "modifiedAt": clock,
+                "isDeleted": isDeleted,
+            ])
+            guard !isDeleted else { continue }
+            let bookIds = fields["bookIds"] as? [String] ?? []
+            let localAddedAtByBookId = Dictionary(
+                (localRefsByShelf[shelfId] ?? []).compactMap { ref -> (String, Int64)? in
+                    guard let bookId = ref["bookId"] as? String else { return nil }
+                    return (bookId, (ref["addedAt"] as? NSNumber)?.int64Value ?? 0)
+                },
+                uniquingKeysWith: { max($0, $1) }
+            )
+            mergedRefs.append(contentsOf: bookIds.enumerated().map { index, bookId in
+                [
+                    "bookId": bookId,
+                    "shelfId": shelfId,
+                    "addedAt": CloudLibrarySnapshotMergeKt.sharedShelfRefAddedAt(
+                        existingAddedAt: localAddedAtByBookId[bookId].map { KotlinLong(longLong: $0) },
+                        shelfClock: clock,
+                        index: Int32(index)
+                    ),
+                ]
+            })
+        }
+        // Shelves only seen locally (never synced yet) survive as-is; the
+        // next push uploads them via cloudKitUploadShelfDirty.
+        let knownShelfIds = Set(mergedRecords.compactMap { $0["id"] as? String })
+        let localRecords = root["shelves"] as? [[String: Any]] ?? []
+        for local in localRecords where !knownShelfIds.contains(local["id"] as? String ?? "") {
+            mergedRecords.append(local)
+        }
+        let knownRefPairs = Set(mergedRefs.map { "\($0["shelfId"] as? String ?? "")/\($0["bookId"] as? String ?? "")" })
+        for ref in localRefsByShelf.values.flatMap({ $0 }) {
+            let key = "\((ref["shelfId"] as? String) ?? "")/\((ref["bookId"] as? String) ?? "")"
+            if !knownRefPairs.contains(key) { mergedRefs.append(ref) }
+        }
+        root["shelves"] = mergedRecords
+        root["bookShelfRefs"] = mergedRefs
+        // Paths are device-local and never written to CloudKit. Keep this
+        // device's path in the returned snapshot so a metadata-only sync
+        // cannot make an installed font disappear (Drive parity).
+        let localFontPaths: [String: String] = {
+            guard let data = preparedLocalJSON.data(using: .utf8),
+                  let localRoot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+            let fonts = localRoot["customFonts"] as? [[String: Any]] ?? []
+            return Dictionary(uniqueKeysWithValues: fonts.compactMap { font in
+                guard let id = font["id"] as? String,
+                      let path = font["path"] as? String, !path.isEmpty else { return nil }
+                return (id, path)
+            })
+        }()
+        root["customFonts"] = maps.fonts.values.compactMap { fields -> [String: Any]? in
+            guard let id = fields["id"] as? String, !id.isEmpty else { return nil }
+            return [
+                "id": id,
+                "displayName": fields["displayName"] as? String ?? id,
+                "fileName": fields["fileName"] as? String ?? "",
+                "fileExtension": fields["fileExtension"] as? String ?? "",
+                "timestamp": (fields["timestamp"] as? NSNumber)?.int64Value ?? 0,
+                "isDeleted": (fields["isDeleted"] as? NSNumber)?.boolValue ?? false,
+                "path": localFontPaths[id] ?? "",
+            ]
+        }
+        guard let encoded = try? JSONSerialization.data(withJSONObject: root),
+              let json = String(data: encoded, encoding: .utf8) else {
+            throw CloudSyncError.invalidSnapshot
+        }
+        return json
+    }
+
+    private func snapshotBook(fromCloudKit fields: [String: Any]) -> [String: Any]? {
+        guard let id = fields["bookId"] as? String,
+              let displayName = fields["displayName"] as? String,
+              let type = fields["type"] as? String else { return nil }
+        var position: [String: Any] = [:]
+        if let cfi = fields["lastPositionCfi"] as? String { position["cfi"] = cfi }
+        if let chapter = (fields["lastChapterIndex"] as? NSNumber)?.intValue { position["chapterIndex"] = chapter }
+        if let block = (fields["locatorBlockIndex"] as? NSNumber)?.intValue { position["blockIndex"] = block }
+        if let offset = (fields["locatorCharOffset"] as? NSNumber)?.intValue { position["charOffset"] = offset }
+        return [
+            "id": id,
+            "path": NSNull(),
+            "type": type,
+            "displayName": displayName,
+            "timestamp": (fields["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+            "annotationModifiedTimestamp": (fields["annotationModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+            "hasAnnotations": (fields["hasAnnotations"] as? NSNumber)?.boolValue ?? false,
+            "title": fields["title"] ?? NSNull(),
+            "author": fields["author"] ?? NSNull(),
+            "progressPercentage": fields["progressPercentage"] ?? NSNull(),
+            "isRecent": (fields["isRecent"] as? NSNumber)?.boolValue ?? true,
+            "isAvailable": false,
+            "fileSize": 0,
+            "fileContentModifiedTimestamp": (fields["fileContentModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+            "metadataModifiedTimestamp": (fields["lastModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+            "sourceFolder": NSNull(),
+            "folderTextMetadataParsed": false,
+            "lastPageIndex": fields["lastPage"] ?? NSNull(),
+            "readerPosition": position.isEmpty ? NSNull() : position,
+            "readerSettings": NSNull(),
+            "readerFormatIsLocal": false,
+            "readerLocalFormatSettings": NSNull(),
+            "readerAutoScrollIsLocal": false,
+            "readerAutoScrollLocalSpeed": NSNull(),
+            "readerBookmarks": sharedBookmarks(from: fields["bookmarksJson"] as? String),
+            "readerHighlights": jsonArray(from: fields["highlightsJson"] as? String),
+            "pdfReaderViewport": NSNull(),
+            "readingPositionModifiedTimestamp": (fields["readingPositionModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0,
+        ]
+    }
+
+    /// Download only winning remote payloads (clock gate): local file missing
+    /// or remote content ts strictly newer. Batched via `fetchContentAssets`
+    /// so a multi-book pull is one round trip, not one per book. Assets are
+    /// fetched lazily only for books this pass actually needs.
+    private func cloudKitDownloadMissingBooks(
+        localJSON: String,
+        maps: CloudKitRemoteMaps
+    ) async throws -> [DownloadedCloudBook] {
+        let localById: [String: [String: Any]] = Dictionary(
+            uniqueKeysWithValues: CloudKitLibraryMapper.parseBooks(localJSON).compactMap { book in
+                guard let id = book["id"] as? String else { return nil }
+                return (id, book)
+            }
+        )
+        // Pass 1: decide what to download from clocks alone (no asset fetch).
+        struct Pending { let bookId: String; let fields: [String: Any]; let contentTs: Int64 }
+        var pending: [Pending] = []
+        for (bookId, fields) in maps.states {
+            guard maps.tombstones[bookId] == nil else { continue }
+            // Skip records whose id is not a usable CloudKit record name. Books
+            // imported by an older build had a device-local absolute path as
+            // their id, and those `BookContent` records are still in the private
+            // database. Their asset can never be staged, so without this one
+            // poisoned record fails the whole pull on every pass and the outbox
+            // spins until it quarantines. The upload side already refuses these
+            // (`cloudKitBookIsSyncable`); this keeps the two symmetric.
+            guard CloudKitLibrarySyncKt.isValidCloudKitLibraryId(id: bookId) else {
+                cloudKitLog("book_undownloadable reason=invalid_id id=\(bookId)")
+                continue
+            }
+            let remoteContentTs = maps.contentModified[bookId] ?? 0
+            guard remoteContentTs > 0 else { continue }
+            let local = localById[bookId]
+            // The snapshot's `fileContentModifiedTimestamp` is 0 for iOS
+            // imports (only the EPUB metadata edit sets it), so the gate reads
+            // the real local file mtime (mirrors `uploadCloudBookContents`).
+            // Otherwise every remote book re-downloads each pass, the exact
+            // mirror of the upload-side `content=0` bug.
+            let localURL = (local?["path"] as? String).flatMap(resolveCloudBookPath)
+            let localExists = localURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            let localTs = localURL.flatMap { url -> Int64? in
+                guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+                let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))
+                    .flatMap { $0.contentModificationDate?.timeIntervalSince1970 }
+                return mtime.map { Int64($0 * 1000) }
+            } ?? (local?["fileContentModifiedTimestamp"] as? NSNumber)?.int64Value ?? 0
+            guard !localExists || remoteContentTs > localTs else { continue }
+            pending.append(Pending(bookId: bookId, fields: fields, contentTs: remoteContentTs))
+        }
+        guard !pending.isEmpty else { return [] }
+        // Pass 2: one batched download for every book this pass needs.
+        // `discardStagedAssets` in a `defer` because the staged copies are
+        // ours to clean: they must not survive the pass, and must not be left
+        // behind when a later book in the batch fails.
+        defer { cloudKitTransport.discardStagedAssets() }
+        let assets = try await cloudKitTransport.fetchContentAssets(bookIds: pending.map(\.bookId))
+        let imports = try cloudImportsDirectory()
+        var downloaded: [DownloadedCloudBook] = []
+        for entry in pending {
+            guard let assetURL = assets[entry.bookId] else { continue }
+            let type = (entry.fields["type"] as? String) ?? ""
+            let ext = CloudBook.primaryExtension(forType: type) ?? "bin"
+            let destination = imports.appendingPathComponent("\(entry.bookId).\(ext)")
+            let temporary = imports.appendingPathComponent(".\(entry.bookId).\(UUID().uuidString).download")
+            try? FileManager.default.removeItem(at: temporary)
+            try FileManager.default.copyItem(at: assetURL, to: temporary)
+            try commitStagedCloudFile(temporary, to: destination)
+            try? FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: Double(entry.contentTs) / 1000)],
+                ofItemAtPath: destination.path
+            )
+            downloaded.append(DownloadedCloudBook(id: entry.bookId, path: destination.path))
+        }
+        return downloaded
+    }
+
+    private func cloudKitDownloadMissingFonts(
+        localJSON: String,
+        maps: CloudKitRemoteMaps
+    ) async throws -> [String: String] {
+        let localById: [String: [String: Any]] = {
+            guard let data = localJSON.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+            let fonts = root["customFonts"] as? [[String: Any]] ?? []
+            return Dictionary(uniqueKeysWithValues: fonts.compactMap { font in
+                guard let id = font["id"] as? String else { return nil }
+                return (id, font)
+            })
+        }()
+        let destinationDirectory = try cloudFontsDirectory()
+        var downloaded: [String: String] = [:]
+        for (fontId, fields) in maps.fonts {
+            guard (fields["isDeleted"] as? NSNumber)?.boolValue != true,
+                  maps.fontContentIds.contains(fontId) else { continue }
+            let remoteTs = (fields["timestamp"] as? NSNumber)?.int64Value ?? 0
+            let local = localById[fontId]
+            let localExists = (local?["path"] as? String)
+                .map({ FileManager.default.fileExists(atPath: $0) }) ?? false
+            let localTs = (local?["timestamp"] as? NSNumber)?.int64Value ?? 0
+            guard !localExists || remoteTs > localTs else { continue }
+            guard let assetURL = try await cloudKitTransport.fetchFontAsset(fontId: fontId) else { continue }
+            defer { cloudKitTransport.discardStagedAssets() }
+            let fileName = (fields["fileName"] as? String).flatMap {
+                URL(fileURLWithPath: $0).lastPathComponent
+            }.flatMap { $0.isEmpty ? nil : $0 } ?? "font-\(fontId)"
+            let destination = destinationDirectory.appendingPathComponent(fileName)
+            let temporary = destinationDirectory.appendingPathComponent(".\(fileName).\(UUID().uuidString).download")
+            try? FileManager.default.removeItem(at: temporary)
+            try FileManager.default.copyItem(at: assetURL, to: temporary)
+            try commitStagedCloudFile(temporary, to: destination)
+            downloaded[fontId] = destination.path
+        }
+        return downloaded
+    }
+
+    /// Remote sidecar records newer than the durable local copy are written
+    /// through `IosPdfCloudSidecarStore` and returned for snapshot injection.
+    private func cloudKitMergeRemoteSidecars(
+        localJSON: String,
+        maps: CloudKitRemoteMaps
+    ) throws -> [DownloadedCloudPdfSidecar] {
+        guard !maps.sidecars.isEmpty else { return [] }
+        let localById = Dictionary(
+            uniqueKeysWithValues: parseCloudPdfSidecars(localJSON).map { ($0.bookId, $0) }
+        )
+        var merged: [DownloadedCloudPdfSidecar] = []
+        for (bookId, remote) in maps.sidecars {
+            let local = localById[bookId] ?? localPdfSidecar(bookId: bookId)
+            guard local == nil || remote.timestamp > (local?.timestamp ?? 0) else { continue }
+            guard SharedPdfCloudSidecarCodec.shared.isCompatiblePayload(rawDataJson: remote.data) else { continue }
+            let data = local.map {
+                mergePdfSidecarData(localData: $0.data, remoteData: remote.data, preferRemoteOnConflict: true)
+            } ?? remote.data
+            let applied = max(remote.timestamp, local?.timestamp ?? 0)
+            guard writePdfSidecar(bookId: bookId, data: data, modifiedTimestamp: applied) else {
+                throw CloudSyncError.sidecarPersistenceFailed(bookId)
+            }
+            merged.append(DownloadedCloudPdfSidecar(
+                bookId: bookId, timestamp: applied, bytes: data.utf8.count, data: data
+            ))
+        }
+        return merged
+    }
+#else
+    // CloudKit missing (non-Apple compiler slice): report unavailable through
+    // the normal status channel. Drive/Firestore path is unaffected.
+    private func syncCloudKitSnapshot(localJSON: String) async {
+        bridge?.completeCloudSync(
+            remoteSnapshotJson: nil,
+            downloadedBookIds: [],
+            downloadedBookPaths: [],
+            status: "iCloud sync is unavailable in this build."
+        )
+    }
+
+    private func uploadMergedCloudKitSnapshot(_ snapshotJSON: String) async {
+        bridge?.completeCloudSync(
+            remoteSnapshotJson: nil,
+            downloadedBookIds: [],
+            downloadedBookPaths: [],
+            status: "iCloud sync is unavailable in this build."
+        )
+    }
+#endif
+
+    private func publish(status: String?) {
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        guard FirebaseApp.app() != nil else {
+            logAccount("publish firebase=absent status=\(status ?? "nil")")
+            publishSignedOut(status: status)
+            return
+        }
+        let user = Auth.auth().currentUser
+        // Every publish is logged, including the anonymous ones. A publish that
+        // ships uid:nil to the UI is the only way the app can appear signed out
+        // without `signout_requested` or `session_dropped` ever being logged,
+        // and that was exactly the shape of the symptom being chased.
+        logAccount(
+            "publish uid=\(Self.uidToken(user?.uid)) status=\(status ?? "nil") hasCurrentUser=\(user != nil)"
+        )
+        let providerIDs = Set(user?.providerData.map(\.providerID) ?? [])
+        let displayName = Self.nonBlank(user?.displayName)
+            ?? Self.cachedAppleIdentity(uid: user?.uid, baseKey: Self.appleDisplayNameKey)
+        let email = Self.nonBlank(user?.email)
+            ?? Self.cachedAppleIdentity(uid: user?.uid, baseKey: Self.appleEmailKey)
+        if let uid = user?.uid {
+            // Freshness write-through: a profile fixed elsewhere (or a newer
+            // Apple pass) replaces the stale cache for next time.
+            if let displayName { UserDefaults.standard.set(displayName, forKey: "\(Self.appleDisplayNameKey).\(uid)") }
+            if let email { UserDefaults.standard.set(email, forKey: "\(Self.appleEmailKey).\(uid)") }
+        }
+        bridge?.updateAccountState(
+            uid: user?.uid,
+            displayName: displayName,
+            email: email,
+            photoUrl: user?.photoURL?.absoluteString,
+            appleLinked: providerIDs.contains("apple.com"),
+            googleLinked: providerIDs.contains("google.com"),
+            googleDriveAuthorized: providerIDs.contains("google.com") && googleDriveAuthorized,
+            status: status,
+            authToken: nil
+        )
+        let publishedUID = user?.uid
+        user?.getIDTokenForcingRefresh(false) { [weak self] token, _ in
+            Task { @MainActor in
+                guard let self, let bridge = self.bridge else { return }
+                bridge.updateAccountAuthToken(authToken: token, expectedUid: publishedUID)
+#if canImport(FirebaseAppCheck)
+                // Attestation rides along with auth: every (re)publish pushes
+                // a fresh App Check token for worker calls.
+                await IosAppCheck.refresh(bridge: bridge)
+#endif
+                // Sessions outlive the ~1h token TTL (Android re-fetches per
+                // call). Keep the synchronously-consumed token live by
+                // force-refreshing ahead of expiry; the uid guard in
+                // updateAccountAuthToken drops late callbacks after rotation.
+                if let uid = publishedUID, token != nil {
+                    self.authTokenFetchedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                    self.scheduleAuthTokenRefresh(uid: uid)
+                }
+            }
+        }
+#else
+        publishSignedOut(status: status)
+#endif
+    }
+
+    private func scheduleAuthTokenRefresh(uid: String) {
+        authTokenRefreshTask?.cancel()
+        authTokenRefreshTask = nil
+#if canImport(FirebaseAuth) && canImport(FirebaseCore)
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let delayMs = AuthTokenRefreshPolicyKt.sharedAuthTokenRefreshDelayMs(nowMs: nowMs, fetchedAtMs: authTokenFetchedAtMs)
+        authTokenRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(delayMs, 0)) * 1_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self, FirebaseApp.app() != nil else { return }
+            guard let user = Auth.auth().currentUser, user.uid == uid else { return }
+            user.getIDTokenForcingRefresh(true) { [weak self] token, _ in
+                Task { @MainActor in
+                    guard let self, let bridge = self.bridge else { return }
+                    bridge.updateAccountAuthToken(authToken: token, expectedUid: uid)
+#if canImport(FirebaseAppCheck)
+                    await IosAppCheck.refresh(bridge: bridge)
+#endif
+                    if token != nil {
+                        self.authTokenFetchedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                        self.scheduleAuthTokenRefresh(uid: uid)
+                    }
+                }
+            }
+        }
+#endif
+    }
+
+    private func cancelAuthTokenRefresh() {
+        authTokenRefreshTask?.cancel()
+        authTokenRefreshTask = nil
+    }
+
+    private func publishSignedOut(status: String?) {
+        cancelAuthTokenRefresh()
+        bridge?.updateAccountState(
+            uid: nil,
+            displayName: nil,
+            email: nil,
+            photoUrl: nil,
+            appleLinked: false,
+            googleLinked: false,
+            googleDriveAuthorized: false,
+            status: status,
+            authToken: nil
+        )
+    }
+
+    private func detachAuthObserver() {
+#if canImport(FirebaseAuth)
+        if let authStateHandle {
+            Auth.auth().removeStateDidChangeListener(authStateHandle)
+            self.authStateHandle = nil
+        }
+#endif
+        cancelAuthTokenRefresh()
+        stopObservingDeviceStatus()
+    }
+
+    deinit {
+        authTokenRefreshTask?.cancel()
+#if canImport(FirebaseAuth)
+        if let authStateHandle {
+            Auth.auth().removeStateDidChangeListener(authStateHandle)
+        }
+#endif
+#if canImport(FirebaseFirestore)
+        deviceStatusListener?.remove()
+#endif
+    }
+
+    private static func randomNonce(length: Int = 32) -> String {
+        precondition(length > 0)
+        let characters = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")
+        var result = ""
+        var remaining = length
+        while remaining > 0 {
+            var bytes = [UInt8](repeating: 0, count: 16)
+            guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+                fatalError("Unable to generate a secure Sign in with Apple nonce.")
+            }
+            for byte in bytes where Int(byte) < characters.count {
+                result.append(characters[Int(byte)])
+                remaining -= 1
+                if remaining == 0 { break }
+            }
+        }
+        return result
+    }
+
+    private static func sha256(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func nonBlank(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func cachedAppleIdentity(uid: String?, baseKey: String) -> String? {
+        if let uid, let perAccount = nonBlank(UserDefaults.standard.string(forKey: "\(baseKey).\(uid)")) {
+            return perAccount
+        }
+        return nonBlank(UserDefaults.standard.string(forKey: baseKey))
+    }
+
+    /// Persists whatever identity this Apple pass carried. These arrive only
+    /// on the first authorization, so every sighting counts.
+    private static func rememberAppleIdentity(fullName: PersonNameComponents?, email: String?) {
+        let name = fullName.map {
+            PersonNameComponentsFormatter.localizedString(from: $0, style: .default)
+        }.flatMap(nonBlank)
+        if let name {
+            UserDefaults.standard.set(name, forKey: appleDisplayNameKey)
+        }
+        if let email = nonBlank(email) {
+            UserDefaults.standard.set(email, forKey: appleEmailKey)
+        }
+    }
+
+    private static func presentingViewController() -> UIViewController? {
+        let root = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)?
+            .rootViewController
+        return deepestPresentedViewController(from: root)
+    }
+
+    private static func deepestPresentedViewController(from root: UIViewController?) -> UIViewController? {
+        if let presented = root?.presentedViewController {
+            return deepestPresentedViewController(from: presented)
+        }
+        if let navigation = root as? UINavigationController {
+            return deepestPresentedViewController(from: navigation.visibleViewController)
+        }
+        if let tabs = root as? UITabBarController {
+            return deepestPresentedViewController(from: tabs.selectedViewController)
+        }
+        return root
+    }
+
+    private static func userFacingAuthError(_ error: Error, provider: String) -> String {
+        let nsError = error as NSError
+        if nsError.code == ASAuthorizationError.canceled.rawValue ||
+            nsError.code == NSUserCancelledError {
+            return "\(provider) sign-in cancelled."
+        }
+        return "\(provider) sign-in failed: \(error.localizedDescription)"
+    }
+}
+
+extension LocalAccountController: ASAuthorizationControllerDelegate {
+    nonisolated func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithAuthorization authorization: ASAuthorization
+    ) {
+        Task { @MainActor in
+#if canImport(FirebaseAuth)
+            guard
+                let appleCredential = authorization.credential as? ASAuthorizationAppleIDCredential,
+                let tokenData = appleCredential.identityToken,
+                let idToken = String(data: tokenData, encoding: .utf8),
+                let nonce = appleNonce
+            else {
+                publish(status: "Apple did not return a usable identity token.")
+                return
+            }
+            appleNonce = nil
+            Self.rememberAppleIdentity(fullName: appleCredential.fullName, email: appleCredential.email)
+            let credential = OAuthProvider.appleCredential(
+                withIDToken: idToken,
+                rawNonce: nonce,
+                fullName: appleCredential.fullName
+            )
+            if self.pendingAccountDeletion {
+                self.pendingAccountDeletion = false
+                do {
+                    try await self.reauthenticateAndDeleteAccount(credential: credential)
+                    self.accountDeletionInFlight = false
+                    self.bridge?.completeAccountDeletion(
+                        success: true,
+                        message: "Your Episteme account was permanently deleted."
+                    )
+                } catch {
+                    self.accountDeletionInFlight = false
+                    let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.bridge?.completeAccountDeletion(success: false, message: message)
+                    self.publish(status: message)
+                }
+                return
+            }
+            do {
+                try await signInOrLink(
+                    credential: credential,
+                    providerID: "apple.com",
+                    providerLabel: "Apple"
+                )
+            } catch {
+                publish(status: Self.userFacingAuthError(error, provider: "Apple"))
+            }
+#endif
+        }
+    }
+
+    nonisolated func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithError error: Error
+    ) {
+        Task { @MainActor in
+            appleNonce = nil
+            if pendingAccountDeletion {
+                pendingAccountDeletion = false
+                accountDeletionInFlight = false
+                bridge?.completeAccountDeletion(success: false, message: "Account deletion cancelled.")
+                publish(status: "Account deletion cancelled.")
+                return
+            }
+            publish(status: Self.userFacingAuthError(error, provider: "Apple"))
+        }
+    }
+}
+
+extension LocalAccountController: ASAuthorizationControllerPresentationContextProviding {
+    nonisolated func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        MainActor.assumeIsolated {
+            let windows = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+            guard let window = windows.first(where: \.isKeyWindow) else {
+                fatalError("Sign in with Apple requires an active application window.")
+            }
+            return window
+        }
+    }
+}
