@@ -19,20 +19,11 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Add swap
-        run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
-
       - name: Accept Android SDK licenses
         run: |
           SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
           yes | "$SDKMANAGER" --licenses > /dev/null || true
 
-      # Debug-only experimental TF Lite detector breaks manifest merging; not needed for the app.
       - name: Drop debug-only TensorFlow Lite
         run: |
           sed -i '/org\.tensorflow/d' app/build.gradle.kts
