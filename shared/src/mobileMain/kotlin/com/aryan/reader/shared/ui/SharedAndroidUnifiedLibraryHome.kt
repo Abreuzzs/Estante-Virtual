@@ -16,7 +16,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.CollectionsBookmark
+import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.FormatListNumbered
@@ -107,7 +107,7 @@ fun <T> SharedAndroidUnifiedLibraryHome(
                 item {
                     IconButton(onClick = { onShelfViewChange(!shelfView) }) {
                         Icon(
-                            Icons.Default.CollectionsBookmark,
+                            Icons.Default.Book,
                             contentDescription = strings.shelfView,
                             tint = if (shelfView) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
