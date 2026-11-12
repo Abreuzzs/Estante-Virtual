@@ -1,0 +1,65 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+      # The project links a Rust bridge with the NDK clang pinned in app/build.gradle.kts; the
+      # NDK must exist before Gradle configures, so install it up front (same as the upstream CI).
+      - name: Install pinned NDK
+        run: |
+          ndk_version=$(sed -n 's/.*androidNdkVersion *= *"\([0-9.]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$ndk_version"
+          SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          "$SDKMANAGER" --install "ndk;$ndk_version"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
+
+      # rustup reads rust/office-oxide-bridge/rust-toolchain.toml and installs the pinned
+      # toolchain and its Android targets on the first cargo run.
+      - name: Prepare Rust toolchain
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v cargo || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path; }
+          cd rust/office-oxide-bridge && cargo --version
+
+      - name: Drop debug-only TensorFlow Lite
+        run: |
+          sed -i '/org\.tensorflow/d' app/build.gradle.kts
+          rm -f app/src/debug/java/com/aryan/reader/ml/ComicPanelDetector.kt
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build OSS debug APK
+        run: >
+          ./gradlew assembleOssDebug --no-daemon --max-workers=1
+          -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+          -Pkotlin.daemon.jvmargs=-Xmx3g
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: episteme-oss-debug-apk
+          path: app/build/outputs/**/*.apk
+          if-no-files-found: error

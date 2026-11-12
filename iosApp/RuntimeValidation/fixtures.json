@@ -1,0 +1,260 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "id": "pdf.sample",
+      "source": "app/src/main/assets/sample.pdf",
+      "kind": "pdf",
+      "ownership": "repository-owned",
+      "use": [
+        "open",
+        "zoom",
+        "search",
+        "split",
+        "diagnostic-performance"
+      ]
+    },
+    {
+      "id": "epub.reader-test-book",
+      "source": "app/src/androidTest/assets/epub/reader_test_book.epub",
+      "kind": "epub",
+      "ownership": "repository-owned-test-fixture",
+      "markers": [
+        "POSITION_TARGET_ALPHA",
+        "HIGHLIGHT_TARGET_BRAVO",
+        "CFI_TARGET_CHARLIE",
+        "SEARCH_TARGET_DELTA",
+        "BOOKMARK_TARGET_ECHO",
+        "POSITION_TARGET_FOXTROT",
+        "ANNOTATION_TARGET_GOLF",
+        "CFI_TARGET_HOTEL"
+      ],
+      "use": [
+        "open",
+        "position-restore",
+        "search",
+        "tts",
+        "media-overlay",
+        "diagnostic-performance"
+      ]
+    },
+    {
+      "id": "pdf.split-secondary",
+      "source": null,
+      "kind": "pdf",
+      "ownership": "manual-or-separately-licensed",
+      "note": "Required for split-reader coverage. It must be byte-distinct from pdf.sample; do not duplicate the primary fixture.",
+      "use": [
+        "split",
+        "diagnostic-performance"
+      ]
+    },
+    {
+      "id": "pdf.scanned",
+      "source": null,
+      "kind": "pdf",
+      "ownership": "manual-or-separately-licensed",
+      "note": "Required to exercise Vision OCR. pdf.sample is text-based and cannot prove the scanned-PDF path.",
+      "use": [
+        "ocr",
+        "search",
+        "selection",
+        "tts",
+        "diagnostic-performance"
+      ]
+    },
+    {
+      "id": "pptx.user-owned",
+      "source": null,
+      "kind": "pptx",
+      "ownership": "manual-or-separately-licensed",
+      "note": "Use a small deck with text, shapes, images, tables, charts, SmartArt, and hyperlinks. Do not commit a binary fixture.",
+      "use": [
+        "open",
+        "slide-navigation",
+        "visual-rendering",
+        "diagnostic-performance"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "launch",
+      "surface": "library",
+      "expected": [
+        "App reaches the library without a crash or blank Compose host.",
+        "Previously persisted library and reader state are restored or an explicit empty state is shown.",
+        "Safe-area and status-bar treatment match the Android intent for the selected reader/library state."
+      ]
+    },
+    {
+      "id": "settings-account-gating",
+      "surface": "settings",
+      "expected": [
+        "Settings root reaches Account, AI, reader, diagnostics, and device-management destinations.",
+        "Signed-out account actions explain sign-in requirements and do not expose a false Pro entitlement.",
+        "Signed-in account state, Pro, credits, Apple/Google linking, and StoreKit restore/purchase states match Android eligibility rules.",
+        "Credential-dependent cloud/paid cases are explicitly marked credential-gated when no disposable authorized account is available.",
+        "Keyboard avoids fields and the back gesture/button returns to the same settings destination."
+      ]
+    },
+    {
+      "id": "diagnostic-export",
+      "surface": "settings-diagnostics",
+      "expected": [
+        "Export is visible only where the iOS capability gate allows it.",
+        "Export produces a non-empty file or share/save presentation and does not expose secrets or full document text.",
+        "The exported data contains bounded reader, EPUB/PDF/OCR/TTS, account, and StoreKit status entries when those flows ran."
+      ]
+    },
+    {
+      "id": "document-open",
+      "surface": "reader",
+      "expected": [
+        "PDF, EPUB, and PPTX open through the iOS importer and reach a usable first page/slide/chapter; external-open fallback is labeled separately.",
+        "Close and reopen preserve the same Android-benchmark reading position contract.",
+        "Unsupported/corrupt/import-cancelled cases report an actionable state and do not strand the app in loading.",
+        "Opening a supported book from another app (Files share sheet / Open With) reaches the reader even when the file was never imported into the library first, on both a warm and a cold launch, and the staged copy survives the startup orphan sweep (`tmp/ExternalOpen/<requestId>/` must keep a fresh modification date).",
+        "Episteme is listed as a handler for the formats it reads (PDF, EPUB, MOBI/AZW3, FB2, TXT, MD, HTML, DOCX, ODT, PPTX, CBZ/CBR/CB7/CBT) in the iOS Open With list, matching the Android VIEW intent filters.",
+        "When the native copy of an external file fails, the reader shows the localized \"Unable to open this file.\" banner (Android `error_external_open_failed`) instead of failing silently."
+      ]
+    },
+    {
+      "id": "tts-session",
+      "surface": "reader-and-listening",
+      "expected": [
+        "Starting reader read-aloud or book listening, letting chunks auto-advance, and letting a book finish never freezes the UI or crashes the app: the synthesizer's next utterance is scheduled off its own delegate callback and the audio session is torn down off the main thread.",
+        "Pause/resume/stop, chapter and chunk skipping, and the speak/stop control in the reader chrome stay responsive while a session is active, including right after an utterance starts.",
+        "Ending a session hands audio back to other apps (the session is deactivated) without blocking the main thread, and interruption resume still restores playback.",
+        "Reader TTS voice settings, the read-aloud chrome labels, and the book replacement sheet are translated in the selected app language (Arabic checked), matching the Android screens."
+      ]
+    },
+    {
+      "id": "pdf-split",
+      "surface": "pdf-split-reader",
+      "expected": [
+        "Two distinct PDF panes accept focus, scrolling, zoom, toolbar taps, and selection independently.",
+        "Divider drag, orientation change, swap, close-pane, back, and close-workspace preserve valid state.",
+        "Background/foreground restores both documents or records the same explicit recovery message as Android.",
+        "No pane interaction blocks the other pane or the system back action."
+      ]
+    },
+    {
+      "id": "pdf-ink-gesture",
+      "surface": "pdf-reader-annotations",
+      "expected": [
+        "A finger or Pencil touch starts ink on the down: the stroke begins exactly under the touch and keeps drawing through fast flicks, without waiting for the touch slop and without dropping mid-line movement.",
+        "A plain tap commits a single-point dot, a second finger cancels the stroke (Android parity), and drawing still works while zoomed and panned.",
+        "Eraser strokes and the Pencil shortcut erase live without leaving ink behind, and the annotations land on the page under the touch on every visible page."
+      ]
+    },
+    {
+      "id": "auto-scroll-chrome",
+      "surface": "epub-and-pdf-readers",
+      "expected": [
+        "The auto-scroll overlay renders identically in the EPUB and PDF vertical readers (same speed menus, slider/stepper and icons as Android) and never overlaps the bottom toolbar: visible chrome clears the bar plus the safe-area inset, hidden chrome drops to the Android rest padding.",
+        "Collapsing the overlay hugs the right edge, expanding centres it, and starting auto-scroll reveals the chrome unless musician mode is on; closing it restores the chrome.",
+        "Starting TTS turns auto-scroll off, and stepping the speed with + or - always reads one decimal (4.0x, never 3.999999).",
+        "EPUB vertical auto-scroll scrolls smoothly at every speed, matching Android's frame-driven pacing instead of stepping."
+      ]
+    },
+    {
+      "id": "media-overlay-narration",
+      "surface": "epub-reader",
+      "expected": [
+        "A narrated book shows the speaker button in the top bar, after the tool row and before the overflow menu, and a book with no media overlays shows no button at all.",
+        "Tapping it starts the publisher's recording from the chapter the reader is in, and the narration bar matches Android: narrator as the title, 'clip / total' as the subtitle, transport, a speed menu whose labels read like Android's (1x, 1.25x), and a stop button.",
+        "The narrated line is highlighted as it speaks, in both reading modes, and the highlight is not selectable - tapping it does not open the selection menu.",
+        "Chapter 1 reports 1 / 3 and chapter 2 reports 1 / 2, so narration carried into the next chapter rather than restarting the one it was in; navigating the reader to another chapter restarts narration there.",
+        "Chapter 3 has no overlay, so the bar disappears at the end of chapter 2 instead of narrating something that was never recorded.",
+        "The narration button's accessibility label is the action ('Start narration' / 'Stop narration') and its tint goes primary while playing, matching Android.",
+        "Starting narration stops read-aloud and an audiobook; starting read-aloud or an audiobook stops narration. Only one voice at a time.",
+        "Locking the device or pulling headphones out pauses narration and resumes only when iOS allows it."
+      ]
+    },
+    {
+      "id": "home-language-selection",
+      "surface": "settings-language",
+      "expected": [
+        "Home > Language matches Android: a search field with the localized Search/Clear labels, radio-button rows with translated language names, and the shared no-results message.",
+        "Filtering accepts tags, aliases and accented or decomposed queries (turkce, espanol, zh cn) and behaves the same as Android's language dialog.",
+        "Picking a language applies it to the reader chrome and the settings summary shows the translated language name."
+      ]
+    },
+    {
+      "id": "pagination-page-turns",
+      "surface": "pdf-and-epub-paginated-readers",
+      "expected": [
+        "PDF: toggling Tap to Turn Pages takes effect on the very next edge tap, without turning pages manually first, and disabling it stops edge taps on the next tap as well. Tapping an edge on the first or last spread does nothing but keeps the chrome hidden, like Android.",
+        "PDF: with Tap to Turn Pages and Realistic Page Turns both on, an edge tap plays the 700 ms curl without stutter, and a single-step tap turn snaps instantly while the curl is off (Android scrollToPage).",
+        "EPUB: with Realistic Page Turns off, a swipe in paginated mode slides the page sets flat like the Android pager - no page curl - and the curl returns as soon as the setting is on.",
+        "Both readers in right-to-left pagination: edge taps advance toward the left in RTL, swipes follow the finger (EPUB slides right for a forward turn), and two-page spreads keep the mirrored page order.",
+        "Vertical-scroll PDF navigation (TOC, search, slider, TTS, links, programmatic jumps) settles instantly like Android scrollToPage; only pagination animates.",
+        "Paginated PDF targeted jumps (TOC/search/slider/initial) land without animation; internal links, jump history, TTS and page turns animate per animatesPagination()."
+      ]
+    },
+    {
+      "id": "performance",
+      "surface": "reader-and-library",
+      "expected": [
+        "Record p50/p95/max frame time for scroll, zoom, split divider drag, and toolbar toggles using Instruments or repeated samples; the in-app snapshot does not provide percentiles.",
+        "Record document-open, page/tile render, OCR, search, TTS interruption/resume, and sync/import latency.",
+        "Record peak memory and resident growth after repeated open/close; investigate monotonic growth.",
+        "Compare the same fixture and operation with Android measurements before accepting a parity result."
+      ]
+    },
+    {
+      "id": "text-selection-lookup",
+      "surface": "reader-epub-and-pdf",
+      "expected": [
+        "Selecting text in an EPUB or PDF shows the Android-parity selection menu: one Dict entry (no duplicate Define/Dictionary), Copy, Speak, Dict, Translate, Search, Note, Clear.",
+        "Define defaults to the Smart AI engine: with AI available (key or signed-in), Dict opens the in-app AI definition popup.",
+        "With Any App selected, Dict/Translate/Search present the iOS share sheet listing installed apps; when Smart AI is selected but AI is unavailable, Dict falls back to the app chooser instead of doing nothing.",
+        "Web engines (Google/Bing/DuckDuckGo) open the matching site via the modern openURL API.",
+        "The PDF selection menu shows five highlight colors plus the spectrum palette button, which opens the highlight palette editor and persists slot changes.",
+        "The EPUB highlight palette editor shows four ARGB slots; tapping a slot opens the shared HSV picker (spectrum, brightness, hex, RGB, reset to the stock color), and Save persists every slot including custom colors, which then appear in the selection menu and the highlights drawer.",
+        "The PDF annotation bottom sheet tool row uses localized Android labels (Copy/Dict/Translate/Search) and the Note/Comments tabs are localized."
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "storekit",
+      "status": "xcode-scheme-only",
+      "note": "Reader Local StoreKit configuration is not attached by direct simctl launch."
+    },
+    {
+      "id": "credentials",
+      "status": "disposable-account-required",
+      "note": "Never capture or commit real credentials, tokens, or unredacted account identifiers."
+    },
+    {
+      "id": "pencil-and-audio-route",
+      "status": "hardware-gated",
+      "note": "Simulator cannot prove Pencil gestures or physical audio-route/lock-screen behavior."
+    },
+    {
+      "id": "scanned-pdf-ocr",
+      "status": "fixture-required",
+      "note": "Use pdf.scanned; the repository text PDF is not an OCR fixture."
+    }
+  ],
+  "telemetry": {
+    "inAppProvides": [
+      "counters",
+      "last-values",
+      "selected-peaks",
+      "bounded-events"
+    ],
+    "inAppDoesNotProvide": [
+      "full-frame-histogram",
+      "p50",
+      "p95"
+    ],
+    "externalEvidenceRequired": [
+      "Instruments Time Profiler",
+      "Instruments Allocations",
+      "repeated timestamp samples"
+    ]
+  }
+}
