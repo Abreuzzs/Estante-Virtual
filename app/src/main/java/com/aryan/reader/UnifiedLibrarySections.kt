@@ -318,7 +318,9 @@ internal fun UnifiedLibraryHome(
         },
         shelfView = shelfView,
         onShelfViewChange = onShelfViewChange,
-        shelfContent = { shelfBooks, shelfControls ->
+        // The bookshelf is the permanent home view, so the grid/list/shelf toggles are hidden.
+        showViewToggles = false,
+        shelfContent = { shelfBooks ->
             BookshelfLibraryView(
                 books = shelfBooks,
                 selectedBookIds = selectedBookIds,
@@ -326,7 +328,6 @@ internal fun UnifiedLibraryHome(
                 usePdfFileNameAsDisplayName = usePdfFileNameAsDisplayName,
                 onBookClick = onBookClick,
                 onBookLongClick = onBookLongClick,
-                controls = shelfControls,
             )
         },
         openTabsContent = {

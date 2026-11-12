@@ -415,7 +415,7 @@ fun UnifiedLibraryScreen(
     val advancedFilterCount = uiState.libraryFilters.activeFilterCount()
     val selectedItems = uiState.contextualActionItems
     // Clean bookshelf home: a full-screen wall with only a minimal top bar.
-    val shelfHomeActive = section == UnifiedLibrarySection.HOME && uiState.unifiedLibraryShelfView
+    val shelfHomeActive = section == UnifiedLibrarySection.HOME
     val shelfSettings = rememberBookshelfSettings()
     val shelfWallColor = bookshelfWallColor(
         shelfSettings.wall,
@@ -555,6 +555,11 @@ fun UnifiedLibraryScreen(
             )
         }
     ) {
+        MaterialTheme(
+            colorScheme = if (shelfHomeActive) bookshelfWallColorScheme(shelfWallColor) else MaterialTheme.colorScheme,
+            typography = MaterialTheme.typography,
+            shapes = MaterialTheme.shapes,
+        ) {
         com.aryan.reader.shared.ui.SharedAndroidUnifiedScaffold(
             section = section,
             showingShelf = selectedShelfId != null,
@@ -712,6 +717,14 @@ fun UnifiedLibraryScreen(
                         onMenu = { scope.launch { drawerState.open() } },
                         onAccount = { scope.launch { accountDrawerState.open() } },
                         avatar = { UnifiedProfileAvatar(uiState) },
+                        organizing = BookshelfUiState.organizing.value,
+                        onToggleOrganize = { BookshelfUiState.organizing.value = !BookshelfUiState.organizing.value },
+                        onCustomize = { BookshelfUiState.customizeRequested.value = true },
+                        organizeLabel = stringResource(
+                            if (BookshelfUiState.organizing.value) R.string.bookshelf_done_organizing else R.string.bookshelf_organize,
+                        ),
+                        customizeLabel = stringResource(R.string.bookshelf_customize),
+                        moreDescription = stringResource(R.string.bookshelf_more_options),
                         menuDescription = stringResource(R.string.unified_library_drawer_title),
                         searchDescription = stringResource(R.string.unified_library_search_books),
                         closeDescription = stringResource(R.string.content_desc_clear_query),
@@ -752,8 +765,8 @@ fun UnifiedLibraryScreen(
                     onControlsClick = { showLibraryControls = true },
                     onAdvancedFiltersClick = { showAdvancedFilters = true },
                     onListViewChange = viewModel::setUnifiedLibraryListView,
-                    shelfView = uiState.unifiedLibraryShelfView,
-                    onShelfViewChange = viewModel::setUnifiedLibraryShelfView,
+                    shelfView = true,
+                    onShelfViewChange = {},
                     widthSizeClass = widthSizeClass,
                     onBookClick = { item ->
                         if (item.type == FileType.AUDIOBOOK) {
@@ -768,7 +781,8 @@ fun UnifiedLibraryScreen(
                     tabsEnabled = uiState.isTabsEnabled,
                     onCloseTab = { viewModel.closeTab(it.bookId) },
                     onCloseAllTabs = { showCloseAllTabsDialog = true },
-                    searchInsideFiles = uiState.libraryState.searchInsideFiles,
+                    // The shelf filters by title/author; the file-content results list is not used here.
+                    searchInsideFiles = false,
                     contentSearchResults = uiState.libraryState.contentSearchResults,
                 )
                 UnifiedLibrarySection.AUDIOBOOKS -> AudiobooksLibrarySection(
@@ -915,6 +929,7 @@ fun UnifiedLibraryScreen(
             }
             },
         )
+        }
             }
         }
     }

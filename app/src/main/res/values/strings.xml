@@ -2709,6 +2709,7 @@
 
     <!-- 3D bookshelf view and reader eye comfort -->
     <string name="bookshelf_title">My books</string>
+    <string name="bookshelf_more_options">More options</string>
     <string name="bookshelf_view">Bookshelf view</string>
     <string name="bookshelf_customize">Customize bookshelf</string>
     <string name="bookshelf_organize">Organize books</string>

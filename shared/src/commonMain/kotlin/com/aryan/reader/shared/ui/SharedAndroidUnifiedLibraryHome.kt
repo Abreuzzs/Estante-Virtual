@@ -91,10 +91,12 @@ fun <T> SharedAndroidUnifiedLibraryHome(
     shelfView: Boolean = false,
     onShelfViewChange: ((Boolean) -> Unit)? = null,
     /**
-     * Receives the books plus the host's filter/sort controls row, which the shelf places below the
-     * bookcase. When the shelf is shown the continue-reading card and the open-tabs strip are hidden.
+     * Renders the books as a bookshelf. When it is shown the continue-reading card and the open-tabs
+     * strip are hidden and the filter/sort controls sit at the top, above the shelves.
      */
-    shelfContent: (@Composable (List<T>, @Composable () -> Unit) -> Unit)? = null,
+    shelfContent: (@Composable (List<T>) -> Unit)? = null,
+    /** Hosts that always show the shelf pass false to drop the grid/list/shelf toggle buttons. */
+    showViewToggles: Boolean = true,
 ) {
     val resolvedGridCells = gridCells ?: widthClass.bookGridCells()
     // Expansion lives here so the row composable stays stateless and the host
@@ -119,7 +121,7 @@ fun <T> SharedAndroidUnifiedLibraryHome(
                     IconButton(onClick = onAdvancedFilters) { Icon(Icons.Default.FilterList, contentDescription = strings.filterBooks) }
                 }
             }
-            if (!contentSearchActive) {
+            if (!contentSearchActive && showViewToggles) {
                 item {
                     IconButton(onClick = { onListViewChange(!useListView) }) {
                         Icon(
@@ -142,12 +144,13 @@ fun <T> SharedAndroidUnifiedLibraryHome(
             }
         }
     }
-    val showShelf = shelfView && shelfContent != null && books.isNotEmpty() && !contentSearchActive
+    val showShelf = shelfView && shelfContent != null && !contentSearchActive
     Column(modifier.fillMaxSize().padding(horizontal = if (showShelf) 0.dp else 20.dp)) {
         if (showShelf && shelfContent != null) {
-            // Clean shelf screen: edge-to-edge shelves, no open-tabs strip or continue card; the host
-            // places the filter/sort controls below the books.
-            Box(Modifier.weight(1f)) { shelfContent(books, controls) }
+            // Clean shelf screen: filter/sort controls on top, then edge-to-edge shelves; no open-tabs
+            // strip or continue card.
+            Box(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 6.dp)) { controls() }
+            Box(Modifier.weight(1f)) { shelfContent(books) }
             return@Column
         }
         openTabsContent()

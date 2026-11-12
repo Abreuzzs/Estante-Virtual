@@ -48,6 +48,13 @@ jobs:
           sed -i '/org\.tensorflow/d' app/build.gradle.kts
           rm -f app/src/debug/java/com/aryan/reader/ml/ComicPanelDetector.kt
 
+      # CI machines are brand new on every run, so Android would otherwise generate a different debug
+      # signing key each time and refuse to update the app already installed on the phone.
+      - name: Use a fixed debug signing key
+        run: |
+          mkdir -p "$HOME/.android"
+          cp ci/debug-keystore.bin "$HOME/.android/debug.keystore"
+
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 

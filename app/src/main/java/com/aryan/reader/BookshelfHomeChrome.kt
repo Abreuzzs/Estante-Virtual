@@ -14,9 +14,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -53,6 +59,40 @@ import androidx.core.view.WindowCompat
  */
 internal object BookshelfAppearance {
     var settings by mutableStateOf<BookshelfSettings?>(null)
+}
+
+/** Actions opened from the top bar's menu but handled by the shelf itself. */
+internal object BookshelfUiState {
+    val organizing = mutableStateOf(false)
+    val customizeRequested = mutableStateOf(false)
+}
+
+/** Keeps Material controls (chips, buttons, sheets) legible on the shelf wall whatever the app theme. */
+@Composable
+internal fun bookshelfWallColorScheme(wall: Color): androidx.compose.material3.ColorScheme {
+    val base = MaterialTheme.colorScheme
+    val ink = bookshelfInkFor(wall)
+    return if (wall.luminance() > 0.5f) {
+        base.copy(
+            onSurface = ink,
+            onSurfaceVariant = ink.copy(alpha = 0.75f),
+            outline = ink.copy(alpha = 0.45f),
+            outlineVariant = ink.copy(alpha = 0.30f),
+            secondaryContainer = Color(0xFFD8CCB4),
+            onSecondaryContainer = ink,
+            surfaceVariant = Color(0xFFDFD4BD),
+            surfaceContainerLow = wall,
+            surface = wall,
+            background = wall,
+        )
+    } else {
+        base.copy(
+            onSurface = ink,
+            onSurfaceVariant = ink.copy(alpha = 0.75f),
+            surface = wall,
+            background = wall,
+        )
+    }
 }
 
 @Composable
@@ -98,7 +138,7 @@ private fun RoundChromeButton(
 ) {
     Box(
         modifier = Modifier
-            .size(44.dp)
+            .size(40.dp)
             .clip(CircleShape)
             .background(ink.copy(alpha = 0.08f))
             .clickable(role = Role.Button, onClickLabel = description, onClick = onClick),
@@ -122,6 +162,12 @@ internal fun ShelfHomeTopBar(
     onMenu: () -> Unit,
     onAccount: () -> Unit,
     avatar: @Composable () -> Unit,
+    organizing: Boolean,
+    onToggleOrganize: () -> Unit,
+    onCustomize: () -> Unit,
+    organizeLabel: String,
+    customizeLabel: String,
+    moreDescription: String,
     menuDescription: String,
     searchDescription: String,
     closeDescription: String,
@@ -135,7 +181,7 @@ internal fun ShelfHomeTopBar(
             .padding(horizontal = 12.dp, vertical = 8.dp)
             .height(48.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (searchOpen) {
             RoundChromeButton(closeDescription, ink, onCloseSearch) {
@@ -182,6 +228,32 @@ internal fun ShelfHomeTopBar(
             )
             RoundChromeButton(searchDescription, ink, onOpenSearch) {
                 Icon(Icons.Default.Search, contentDescription = null, tint = ink)
+            }
+            var menuOpen by remember { mutableStateOf(false) }
+            Box {
+                RoundChromeButton(moreDescription, ink, { menuOpen = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = null, tint = ink)
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text(organizeLabel) },
+                        onClick = {
+                            menuOpen = false
+                            onToggleOrganize()
+                        },
+                        leadingIcon = {
+                            Icon(if (organizing) Icons.Default.Check else Icons.Default.SwapHoriz, contentDescription = null)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(customizeLabel) },
+                        onClick = {
+                            menuOpen = false
+                            onCustomize()
+                        },
+                        leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null) },
+                    )
+                }
             }
             RoundChromeButton(accountDescription, ink, onAccount) { avatar() }
         }

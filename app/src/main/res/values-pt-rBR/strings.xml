@@ -1908,6 +1908,7 @@
 
     <!-- Estante 3D -->
     <string name="bookshelf_title">Meus livros</string>
+    <string name="bookshelf_more_options">Mais opções</string>
     <string name="bookshelf_view">Visualização em estante</string>
     <string name="bookshelf_customize">Personalizar estante</string>
     <string name="bookshelf_organize">Organizar livros</string>

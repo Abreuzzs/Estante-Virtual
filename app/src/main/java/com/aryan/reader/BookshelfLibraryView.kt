@@ -54,6 +54,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -124,34 +125,6 @@ private fun shelfPalette(wall: BookshelfWall, finish: BookshelfFinish, systemDar
     }
 }
 
-/** Keeps Material controls (chips, buttons) legible on the shelf wall whatever the app theme. */
-@Composable
-private fun wallColorScheme(wall: Color): androidx.compose.material3.ColorScheme {
-    val base = MaterialTheme.colorScheme
-    val ink = bookshelfInkFor(wall)
-    return if (wall.luminance() > 0.5f) {
-        base.copy(
-            onSurface = ink,
-            onSurfaceVariant = ink.copy(alpha = 0.75f),
-            outline = ink.copy(alpha = 0.45f),
-            outlineVariant = ink.copy(alpha = 0.30f),
-            secondaryContainer = Color(0xFFD8CCB4),
-            onSecondaryContainer = ink,
-            surfaceVariant = Color(0xFFDFD4BD),
-            surfaceContainerLow = wall,
-            surface = wall,
-            background = wall,
-        )
-    } else {
-        base.copy(
-            onSurface = ink,
-            onSurfaceVariant = ink.copy(alpha = 0.75f),
-            surface = wall,
-            background = wall,
-        )
-    }
-}
-
 private val SpineTints = listOf(
     Color(0xFF7B2D3A), // burgundy
     Color(0xFF2F5D50), // forest
@@ -212,9 +185,16 @@ internal fun BookshelfLibraryView(
     val store = remember(context) { BookshelfPreferences(context) }
     var settings by remember { mutableStateOf(BookshelfAppearance.settings ?: store.loadSettings()) }
     var order by remember { mutableStateOf(store.loadOrder()) }
-    var organizing by rememberSaveable { mutableStateOf(false) }
+    // Organize/customize are opened from the screen's top-bar menu, so their state is shared.
+    var organizing by BookshelfUiState.organizing
+    var showCustomize by BookshelfUiState.customizeRequested
     var pickedId by rememberSaveable { mutableStateOf<String?>(null) }
-    var showCustomize by rememberSaveable { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        onDispose {
+            BookshelfUiState.organizing.value = false
+            BookshelfUiState.customizeRequested.value = false
+        }
+    }
 
     val systemDark = MaterialTheme.colorScheme.surface.luminance() < 0.5f
     val palette = remember(settings.wall, settings.finish, systemDark) {
@@ -239,7 +219,7 @@ internal fun BookshelfLibraryView(
     }
 
     MaterialTheme(
-        colorScheme = wallColorScheme(palette.wall),
+        colorScheme = bookshelfWallColorScheme(palette.wall),
         typography = MaterialTheme.typography,
         shapes = MaterialTheme.shapes,
     ) {
@@ -278,6 +258,20 @@ internal fun BookshelfLibraryView(
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.padding(start = ShelfSidePadding, bottom = 4.dp),
                                 )
+                            }
+                        }
+                        if (packed.isEmpty()) {
+                            item(key = "empty") {
+                                Box(
+                                    Modifier.fillMaxWidth().padding(top = 96.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.unified_library_no_books),
+                                        color = palette.ink.copy(alpha = 0.7f),
+                                        style = MaterialTheme.typography.bodyLarge,
+                                    )
+                                }
                             }
                         }
                         packed.forEach { packedGroup ->
@@ -320,39 +314,6 @@ internal fun BookshelfLibraryView(
                         if (controls != null) {
                             item(key = "controls") {
                                 Box(Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp)) { controls() }
-                            }
-                        }
-                        item(key = "tools") {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                FilledTonalIconButton(
-                                    onClick = {
-                                        organizing = !organizing
-                                        pickedId = null
-                                    },
-                                    modifier = Modifier.size(44.dp).testTag("BookshelfOrganizeToggle"),
-                                    colors = if (organizing) {
-                                        IconButtonDefaults.filledIconButtonColors()
-                                    } else {
-                                        IconButtonDefaults.filledTonalIconButtonColors()
-                                    },
-                                ) {
-                                    Icon(
-                                        if (organizing) Icons.Default.Check else Icons.Default.SwapHoriz,
-                                        contentDescription = stringResource(
-                                            if (organizing) R.string.bookshelf_done_organizing else R.string.bookshelf_organize,
-                                        ),
-                                    )
-                                }
-                                FilledTonalIconButton(
-                                    onClick = { showCustomize = true },
-                                    modifier = Modifier.size(44.dp).testTag("BookshelfCustomize"),
-                                ) {
-                                    Icon(Icons.Default.Tune, contentDescription = stringResource(R.string.bookshelf_customize))
-                                }
                             }
                         }
                     }
