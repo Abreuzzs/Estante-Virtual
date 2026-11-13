@@ -53,6 +53,8 @@ fun androidSettingsHubInput(
         includeHideReaderAi = !isOfflineBuild,
         includeCloudLocalDataClear = supportsSync,
         supportProjectAvailable = isOssBuild,
+        // The app is for reading: no Help, Support or About entries in Settings.
+        includeHelpAbout = false,
         isTabsEnabled = uiState.isTabsEnabled,
         isSyncEnabled = uiState.isSyncEnabled,
         isFolderSyncEnabled = uiState.isFolderSyncEnabled,

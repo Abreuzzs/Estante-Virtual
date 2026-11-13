@@ -64,7 +64,10 @@ class AndroidSettingsHubModelsTest {
         assertFalse(SharedSettingsAction.FOLDER_SYNC in actions)
         assertFalse(SharedSettingsAction.DEVICE_MANAGEMENT in actions)
         assertFalse(SharedSettingsAction.CLEAR_CLOUD_LOCAL_DATA in actions)
-        assertTrue(SharedSettingsAction.SUPPORT in actions)
+        // The Android app is reading-focused: Help, Support and About are not offered in Settings.
+        assertFalse(SharedSettingsAction.SUPPORT in actions)
+        assertFalse(SharedSettingsAction.HELP_FEEDBACK in actions)
+        assertFalse(SharedSettingsAction.ABOUT in actions)
         assertEquals(SharedFeaturePolicy.OssOnline, input.featurePolicy)
         assertEquals(
             "TTS & AI",

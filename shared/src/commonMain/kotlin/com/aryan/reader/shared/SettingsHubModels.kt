@@ -707,6 +707,8 @@ data class SharedSettingsHubInput(
     val includeFpsOverlayToggle: Boolean = false,
     val fpsOverlayEnabled: Boolean = false,
     val supportProjectAvailable: Boolean = true,
+    /** Hosts focused purely on reading can hide the Help, Support and About entries. */
+    val includeHelpAbout: Boolean = true,
     val languageTitle: String = "Language",
     val languageSummary: String = "Choose the app language",
     val isTabsEnabled: Boolean = true,
@@ -1091,6 +1093,7 @@ fun sharedSettingsHubModel(input: SharedSettingsHubInput): SharedSettingsHubMode
         SharedSettingsSectionModel(
             section = SharedSettingsSection.HELP,
             items = buildList {
+                if (!input.includeHelpAbout) return@buildList
                 if (input.featurePolicy.projectLinks) {
                     add(
                         SharedSettingsItemModel(
