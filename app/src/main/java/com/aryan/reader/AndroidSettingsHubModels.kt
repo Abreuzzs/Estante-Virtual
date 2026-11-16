@@ -55,6 +55,8 @@ fun androidSettingsHubInput(
         supportProjectAvailable = isOssBuild,
         // The app is for reading: no Help, Support or About entries in Settings.
         includeHelpAbout = false,
+        // One fixed green and beige look: no theme picker.
+        includeAppTheme = false,
         isTabsEnabled = uiState.isTabsEnabled,
         isSyncEnabled = uiState.isSyncEnabled,
         isFolderSyncEnabled = uiState.isFolderSyncEnabled,

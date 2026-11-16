@@ -993,7 +993,7 @@ private fun BookshelfCustomizeSheet(
             }
         }
         SheetSection(stringResource(R.string.bookshelf_wall)) {
-            BookshelfWall.entries.forEach { option ->
+            BookshelfWall.entries.filter { it != BookshelfWall.AUTO && it != BookshelfWall.SLATE }.forEach { option ->
                 FilterChip(
                     selected = settings.wall == option,
                     onClick = { onSettingsChange(settings.copy(wall = option)) },
@@ -1004,6 +1004,7 @@ private fun BookshelfCustomizeSheet(
                                     BookshelfWall.AUTO -> R.string.bookshelf_wall_auto
                                     BookshelfWall.CREAM -> R.string.bookshelf_wall_cream
                                     BookshelfWall.SAND -> R.string.bookshelf_wall_sand
+                                    BookshelfWall.SAGE -> R.string.bookshelf_wall_sage
                                     BookshelfWall.SLATE -> R.string.bookshelf_wall_slate
                                 },
                             ),

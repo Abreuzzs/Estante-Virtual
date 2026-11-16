@@ -709,6 +709,8 @@ data class SharedSettingsHubInput(
     val supportProjectAvailable: Boolean = true,
     /** Hosts focused purely on reading can hide the Help, Support and About entries. */
     val includeHelpAbout: Boolean = true,
+    /** Hosts with a single fixed look hide the App theme entry. */
+    val includeAppTheme: Boolean = true,
     val languageTitle: String = "Language",
     val languageSummary: String = "Choose the app language",
     val isTabsEnabled: Boolean = true,
@@ -766,13 +768,15 @@ fun sharedSettingsHubModel(input: SharedSettingsHubInput): SharedSettingsHubMode
         SharedSettingsSectionModel(
             section = SharedSettingsSection.APP_LIBRARY,
             items = buildList {
-                add(
-                    SharedSettingsItemModel(
-                        action = SharedSettingsAction.APP_THEME,
-                        title = "App theme",
-                        summary = "Theme mode, contrast, reading text dimming, and custom app colors"
+                if (input.includeAppTheme) {
+                    add(
+                        SharedSettingsItemModel(
+                            action = SharedSettingsAction.APP_THEME,
+                            title = "App theme",
+                            summary = "Theme mode, contrast, reading text dimming, and custom app colors"
+                        )
                     )
-                )
+                }
                 if (input.includeCustomFonts) {
                     add(
                         SharedSettingsItemModel(

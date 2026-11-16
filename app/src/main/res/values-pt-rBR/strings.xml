@@ -87,7 +87,7 @@
     <string name="filter_folders">Pastas: %1$d</string>
     <string name="filter_status">Status: %1$s</string>
     <string name="tab_all_books">Todos os livros</string>
-    <string name="tab_shelves">Estantes</string>
+    <string name="tab_shelves">Coleções</string>
     <string name="tab_folders">Pastas</string>
     <string name="tab_catalogs">Catálogos</string>
     <string name="no_results_found">Nenhum resultado encontrado para \"%1$s\"</string>
@@ -1519,8 +1519,8 @@
     <string name="unified_library_your_books">Seus livros</string>
     <string name="unified_library_all">Todos</string>
     <string name="unified_library_reading">Lendo</string>
-    <string name="unified_library_finished">Finalizado</string>
-    <string name="unified_library_unread">Não lido</string>
+    <string name="unified_library_finished">Lidos</string>
+    <string name="unified_library_unread">Quero ler</string>
     <string name="unified_library_drawer_title">Sua biblioteca</string>
     <string name="unified_library_import">Importar arquivos</string>
     <string name="unified_library_manage_shelves">Gerenciar estantes</string>
@@ -1543,7 +1543,7 @@
     <string name="nav_unified_library">Biblioteca Beta</string>
     <string name="unified_library_no_books">Nenhum livro nesta visualização</string>
     <string name="unified_library_browse_all">Ver todos os livros</string>
-    <string name="unified_library_home">Início</string>
+    <string name="unified_library_home">Minha estante</string>
     <string name="unified_library_library_tools">Ferramentas da biblioteca</string>
     <string name="unified_library_appearance">Aparência</string>
     <string name="unified_library_grid_view">Visualização em grade</string>
@@ -1936,6 +1936,7 @@
     <string name="bookshelf_wall">Parede</string>
     <string name="bookshelf_wall_auto">Seguir o tema</string>
     <string name="bookshelf_wall_cream">Creme</string>
+    <string name="bookshelf_wall_sage">Verde-sálvia</string>
     <string name="bookshelf_wall_sand">Areia</string>
     <string name="bookshelf_wall_slate">Ardósia</string>
     <string name="bookshelf_group_all">Todos os livros</string>
@@ -1943,7 +1944,7 @@
     <string name="bookshelf_group_unknown_author">Autor desconhecido</string>
     <string name="bookshelf_group_reading">Lendo</string>
     <string name="bookshelf_group_unread">Quero ler</string>
-    <string name="bookshelf_group_finished">Já li</string>
+    <string name="bookshelf_group_finished">Lidos</string>
 
     <!-- Conforto visual no leitor (dentro do ajuste de brilho) -->
     <string name="reader_eye_warm_title">Filtro de luz azul</string>

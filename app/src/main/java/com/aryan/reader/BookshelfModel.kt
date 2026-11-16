@@ -22,7 +22,7 @@ internal enum class BookshelfDisplay { MIXED, COVERS, SPINES }
 
 internal enum class BookshelfFinish { WALNUT, OAK, EBONY, WHITE }
 
-internal enum class BookshelfWall { AUTO, CREAM, SAND, SLATE }
+internal enum class BookshelfWall { AUTO, CREAM, SAND, SAGE, SLATE }
 
 internal data class BookshelfSettings(
     val grouping: BookshelfGrouping = BookshelfGrouping.SERIES,
@@ -278,7 +278,7 @@ internal class BookshelfPreferences(context: Context) {
         grouping = prefs.getString(KEY_GROUPING, null).toEnumOrDefault(BookshelfGrouping.SERIES),
         display = prefs.getString(KEY_DISPLAY, null).toEnumOrDefault(BookshelfDisplay.MIXED),
         finish = prefs.getString(KEY_FINISH, null).toEnumOrDefault(BookshelfFinish.WALNUT),
-        wall = prefs.getString(KEY_WALL, null).toEnumOrDefault(BookshelfWall.AUTO),
+        wall = prefs.getString(KEY_WALL, null).toEnumOrDefault(BookshelfWall.CREAM),
     )
 
     fun saveSettings(settings: BookshelfSettings) {

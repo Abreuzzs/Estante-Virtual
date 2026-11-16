@@ -78,8 +78,6 @@ internal fun bookshelfWallColorScheme(wall: Color): androidx.compose.material3.C
             onSurfaceVariant = ink.copy(alpha = 0.75f),
             outline = ink.copy(alpha = 0.45f),
             outlineVariant = ink.copy(alpha = 0.30f),
-            secondaryContainer = Color(0xFFD8CCB4),
-            onSecondaryContainer = ink,
             surfaceVariant = Color(0xFFDFD4BD),
             surfaceContainerLow = wall,
             surface = wall,
@@ -103,10 +101,12 @@ internal fun rememberBookshelfSettings(): BookshelfSettings {
 }
 
 internal fun bookshelfWallColor(wall: BookshelfWall, systemDark: Boolean): Color = when (wall) {
-    BookshelfWall.CREAM -> Color(0xFFEDE5D5)
-    BookshelfWall.SAND -> Color(0xFFDDCDAE)
+    BookshelfWall.CREAM -> Color(0xFFF1EADA)
+    BookshelfWall.SAND -> Color(0xFFE6DAC0)
+    BookshelfWall.SAGE -> Color(0xFFD9E5D8)
     BookshelfWall.SLATE -> Color(0xFF262A31)
-    BookshelfWall.AUTO -> if (systemDark) Color(0xFF262A31) else Color(0xFFEDE5D5)
+    // The app has a single light theme now, so "match theme" is simply the cream wall.
+    BookshelfWall.AUTO -> Color(0xFFF1EADA)
 }
 
 internal fun bookshelfInkFor(wallColor: Color): Color =

@@ -19,17 +19,26 @@
  */
 package com.aryan.reader.ui.theme
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.res.Resources
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ColorScheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import com.materialkolor.PaletteStyle
@@ -114,6 +123,61 @@ private val darkScheme = darkColorScheme(
     surfaceContainerHighest = surfaceContainerHighestDark,
 )
 
+/**
+ * The one and only Episteme look: deep green with warm beige, in the spirit of a library.
+ *
+ * Theme choice (light/dark, dynamic colours, custom seeds, contrast) was removed on purpose: the app is
+ * for reading, and a single, carefully balanced palette keeps every screen consistent. The old
+ * parameters are still accepted so existing callers keep compiling, but they no longer change anything.
+ */
+private val EpistemeScheme = lightColorScheme(
+    primary = Color(0xFF2F6B55),
+    onPrimary = Color(0xFFFFFBF0),
+    primaryContainer = Color(0xFFD5E7DB),
+    onPrimaryContainer = Color(0xFF0E3326),
+    secondary = Color(0xFF7B6A4A),
+    onSecondary = Color(0xFFFFFBF0),
+    // Sage: selected chips, drawer items and tonal buttons pick up the green identity.
+    secondaryContainer = Color(0xFFD5E7DB),
+    onSecondaryContainer = Color(0xFF0E3326),
+    tertiary = Color(0xFFA9823F),
+    onTertiary = Color(0xFFFFFFFF),
+    tertiaryContainer = Color(0xFFF2E3BC),
+    onTertiaryContainer = Color(0xFF3A2A06),
+    error = Color(0xFFB3261E),
+    onError = Color(0xFFFFFFFF),
+    errorContainer = Color(0xFFF9DEDC),
+    onErrorContainer = Color(0xFF410E0B),
+    background = Color(0xFFF1EADA),
+    onBackground = Color(0xFF22201A),
+    surface = Color(0xFFF1EADA),
+    onSurface = Color(0xFF22201A),
+    surfaceVariant = Color(0xFFE3DAC6),
+    onSurfaceVariant = Color(0xFF565041),
+    outline = Color(0xFF857D6A),
+    outlineVariant = Color(0xFFCFC6AF),
+    scrim = Color(0xFF000000),
+    inverseSurface = Color(0xFF2E2B24),
+    inverseOnSurface = Color(0xFFF4EEDF),
+    inversePrimary = Color(0xFF9ED2B7),
+    surfaceDim = Color(0xFFD8D0BC),
+    surfaceBright = Color(0xFFF7F2E5),
+    surfaceContainerLowest = Color(0xFFFBF8EF),
+    surfaceContainerLow = Color(0xFFEDE5D3),
+    surfaceContainer = Color(0xFFE8DFCB),
+    surfaceContainerHigh = Color(0xFFE2D9C4),
+    surfaceContainerHighest = Color(0xFFDCD2BC),
+)
+
+private val EpistemeShapes = Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small = RoundedCornerShape(10.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(22.dp),
+    extraLarge = RoundedCornerShape(30.dp),
+)
+
+@Suppress("UNUSED_PARAMETER")
 @Composable
 fun AppTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
@@ -124,74 +188,43 @@ fun AppTheme(
     appFontFamily: FontFamily? = null,
     content: @Composable () -> Unit
 ) {
-    val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-    val context = LocalContext.current
-
-    val baseColorScheme = remember(
-        darkTheme, dynamicColor, supportsDynamicColor, seedColor, contrastLevel
-    ) {
-        when {
-            seedColor != null -> dynamicColorScheme(
-                seedColor = seedColor,
-                isDark = darkTheme,
-                contrastLevel = contrastLevel,
-                style = PaletteStyle.Fidelity
+    val finalColorScheme = remember(textDimFactor) {
+        if (textDimFactor >= 1.0f) {
+            EpistemeScheme
+        } else {
+            EpistemeScheme.copy(
+                onBackground = EpistemeScheme.onBackground.copy(alpha = textDimFactor),
+                onSurface = EpistemeScheme.onSurface.copy(alpha = textDimFactor),
+                onSurfaceVariant = EpistemeScheme.onSurfaceVariant.copy(alpha = textDimFactor),
             )
-            dynamicColor && supportsDynamicColor -> {
-                if (darkTheme) {
-                    resolveDynamicScheme(
-                        dynamic = { dynamicDarkColorScheme(context) },
-                        static = darkScheme,
-                    )
-                } else {
-                    resolveDynamicScheme(
-                        dynamic = { dynamicLightColorScheme(context) },
-                        static = lightScheme,
-                    )
-                }
-            }
-            darkTheme -> darkScheme
-            else -> lightScheme
         }
     }
 
-    val finalColorScheme = remember(baseColorScheme, textDimFactor) {
-        if (textDimFactor >= 1.0f) {
-            baseColorScheme
-        } else {
-            baseColorScheme.copy(
-                primary = baseColorScheme.primary.copy(alpha = textDimFactor),
-                secondary = baseColorScheme.secondary.copy(alpha = textDimFactor),
-                tertiary = baseColorScheme.tertiary.copy(alpha = textDimFactor),
-                error = baseColorScheme.error.copy(alpha = textDimFactor),
-                primaryContainer = baseColorScheme.primaryContainer.copy(alpha = textDimFactor),
-                secondaryContainer = baseColorScheme.secondaryContainer.copy(alpha = textDimFactor),
-                tertiaryContainer = baseColorScheme.tertiaryContainer.copy(alpha = textDimFactor),
-                errorContainer = baseColorScheme.errorContainer.copy(alpha = textDimFactor),
-                outline = baseColorScheme.outline.copy(alpha = textDimFactor),
-                outlineVariant = baseColorScheme.outlineVariant.copy(alpha = textDimFactor),
-                inversePrimary = baseColorScheme.inversePrimary.copy(alpha = textDimFactor),
-                inverseOnSurface = baseColorScheme.inverseOnSurface.copy(alpha = textDimFactor),
-                onPrimary = baseColorScheme.onPrimary.copy(alpha = textDimFactor),
-                onSecondary = baseColorScheme.onSecondary.copy(alpha = textDimFactor),
-                onTertiary = baseColorScheme.onTertiary.copy(alpha = textDimFactor),
-                onBackground = baseColorScheme.onBackground.copy(alpha = textDimFactor),
-                onSurface = baseColorScheme.onSurface.copy(alpha = textDimFactor),
-                onSurfaceVariant = baseColorScheme.onSurfaceVariant.copy(alpha = textDimFactor),
-                onError = baseColorScheme.onError.copy(alpha = textDimFactor),
-                onPrimaryContainer = baseColorScheme.onPrimaryContainer.copy(alpha = textDimFactor),
-                onSecondaryContainer = baseColorScheme.onSecondaryContainer.copy(alpha = textDimFactor),
-                onTertiaryContainer = baseColorScheme.onTertiaryContainer.copy(alpha = textDimFactor),
-                onErrorContainer = baseColorScheme.onErrorContainer.copy(alpha = textDimFactor),
-            )
+    // Light surfaces everywhere, so system bar icons are always dark.
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = view.context.findThemeActivity()?.window
+            if (window != null) {
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.isAppearanceLightStatusBars = true
+                controller.isAppearanceLightNavigationBars = true
+            }
         }
     }
 
     MaterialTheme(
         colorScheme = finalColorScheme,
         typography = appFontFamily?.let { AppTypography.withAppFontFamily(it) } ?: AppTypography,
+        shapes = EpistemeShapes,
         content = content
     )
+}
+
+private tailrec fun Context.findThemeActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findThemeActivity()
+    else -> null
 }
 
 /**

@@ -29,6 +29,9 @@ import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.core.tween
@@ -296,7 +299,21 @@ fun AppNavigation(
             }
         }
 
-        NavHost(navController = navController, startDestination = SharedMobileAppDestination.MAIN.route) {
+        NavHost(
+            navController = navController,
+            startDestination = SharedMobileAppDestination.MAIN.route,
+            // Screens ease in with a gentle fade and settle from a slightly smaller size, like a book
+            // being brought closer; going back reverses it. Short, so the app always feels quick.
+            enterTransition = {
+                fadeIn(tween(280, easing = FastOutSlowInEasing)) +
+                    scaleIn(initialScale = 0.96f, animationSpec = tween(280, easing = FastOutSlowInEasing))
+            },
+            exitTransition = { fadeOut(tween(160)) },
+            popEnterTransition = { fadeIn(tween(240, easing = FastOutSlowInEasing)) },
+            popExitTransition = {
+                fadeOut(tween(200)) + scaleOut(targetScale = 0.96f, animationSpec = tween(200))
+            },
+        ) {
         composable(SharedMobileAppDestination.MAIN.route) {
             Timber.d("Navigating to Main Screen (${SharedMobileAppDestination.MAIN.route}).")
             if (uiState.isTemporaryExternalOpen) {
