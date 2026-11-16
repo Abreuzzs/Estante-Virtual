@@ -5,12 +5,34 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      # Upload a zip into the "updates" folder (GitHub web: Add file > Upload files) and it is
+      # unpacked over the project, committed, and built in this same run.
+      - name: Apply uploaded update zip (if any)
+        run: |
+          shopt -s nullglob
+          zips=(updates/*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "Applying $z"
+              unzip -o "$z" -x '.github/*' '__MACOSX/*'
+              git rm -f "$z"
+            done
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add -A
+            git commit -m "Apply uploaded update"
+            git push
+          fi
 
       - uses: actions/setup-java@v4
         with:
@@ -24,8 +46,6 @@ jobs:
           SDKMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
           yes | "$SDKMANAGER" --licenses > /dev/null || true
 
-      # The project links a Rust bridge with the NDK clang pinned in app/build.gradle.kts; the
-      # NDK must exist before Gradle configures, so install it up front (same as the upstream CI).
       - name: Install pinned NDK
         run: |
           ndk_version=$(sed -n 's/.*androidNdkVersion *= *"\([0-9.]*\)".*/\1/p' app/build.gradle.kts | head -1)
@@ -34,8 +54,6 @@ jobs:
           "$SDKMANAGER" --install "ndk;$ndk_version"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
 
-      # rustup reads rust/office-oxide-bridge/rust-toolchain.toml and installs the pinned
-      # toolchain and its Android targets on the first cargo run.
       - name: Prepare Rust toolchain
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -48,12 +66,13 @@ jobs:
           sed -i '/org\.tensorflow/d' app/build.gradle.kts
           rm -f app/src/debug/java/com/aryan/reader/ml/ComicPanelDetector.kt
 
-      # CI machines are brand new on every run, so Android would otherwise generate a different debug
-      # signing key each time and refuse to update the app already installed on the phone.
+      # Same signing key on every build, so each APK can be installed over the previous one.
       - name: Use a fixed debug signing key
         run: |
-          mkdir -p "$HOME/.android"
-          cp ci/debug-keystore.bin "$HOME/.android/debug.keystore"
+          if [ -f ci/debug-keystore.bin ]; then
+            mkdir -p "$HOME/.android"
+            cp ci/debug-keystore.bin "$HOME/.android/debug.keystore"
+          fi
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew

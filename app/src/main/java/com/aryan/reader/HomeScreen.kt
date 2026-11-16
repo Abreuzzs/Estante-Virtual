@@ -357,7 +357,7 @@ internal fun AppDrawerContent(
                 )
             }
 
-            if (isOss || showSupportProject) {
+            if (!isOss && showSupportProject) {
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Outlined.FavoriteBorder, contentDescription = null) },
                     label = { Text(stringResource(R.string.drawer_support_project)) },
@@ -367,13 +367,15 @@ internal fun AppDrawerContent(
                 )
             }
 
-            NavigationDrawerItem(
-                icon = { Icon(painterResource(id = R.drawable.feedback), contentDescription = null) },
-                label = { Text(stringResource(R.string.drawer_help_feedback)) },
-                selected = false,
-                onClick = { navController.navigateIfReady(SharedMobileAppDestination.FEEDBACK) },
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-            )
+            if (!isOss) {
+                NavigationDrawerItem(
+                    icon = { Icon(painterResource(id = R.drawable.feedback), contentDescription = null) },
+                    label = { Text(stringResource(R.string.drawer_help_feedback)) },
+                    selected = false,
+                    onClick = { navController.navigateIfReady(SharedMobileAppDestination.FEEDBACK) },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
 
             if (!isOss) {
                 if (uiState.currentUser != null) {

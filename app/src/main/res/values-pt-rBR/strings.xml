@@ -1909,6 +1909,8 @@
     <!-- Estante 3D -->
     <string name="bookshelf_title">Meus livros</string>
     <string name="bookshelf_more_options">Mais opções</string>
+    <string name="bookshelf_online_covers">Identificar livros online</string>
+    <string name="bookshelf_online_covers_desc">Busca a capa real dos livros que não têm capa, usando título e autor. Só quando houver internet.</string>
     <string name="bookshelf_view">Visualização em estante</string>
     <string name="bookshelf_customize">Personalizar estante</string>
     <string name="bookshelf_organize">Organizar livros</string>

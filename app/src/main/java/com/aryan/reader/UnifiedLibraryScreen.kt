@@ -415,6 +415,11 @@ fun UnifiedLibraryScreen(
     }
     val advancedFilterCount = uiState.libraryFilters.activeFilterCount()
     val selectedItems = uiState.contextualActionItems
+    // Recognise books without a cover in the background (only when online; skips books already tried).
+    val coverLookupContext = LocalContext.current
+    LaunchedEffect(uiState.recentFiles.size) {
+        BookCoverEnrichmentWorker.enqueue(coverLookupContext)
+    }
     // Clean bookshelf home: a full-screen wall with only a minimal top bar.
     val shelfHomeActive = section == UnifiedLibrarySection.HOME
     val shelfSettings = rememberBookshelfSettings()
@@ -477,6 +482,11 @@ fun UnifiedLibraryScreen(
             drawerContent = {
                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                     val accountContext = LocalContext.current
+                    MaterialTheme(
+                        colorScheme = bookshelfWallColorScheme(shelfWallColor),
+                        typography = MaterialTheme.typography,
+                        shapes = MaterialTheme.shapes,
+                    ) {
                     AppDrawerContent(
                         uiState = uiState,
                         onSignInClick = {
@@ -513,14 +523,12 @@ fun UnifiedLibraryScreen(
                                 navController.navigateIfReady(com.aryan.reader.shared.ui.SharedMobileAppDestination.FOLDER_SYNC_SETTINGS)
                             }
                         },
-                        onAboutClick = {
-                            scope.launch { accountDrawerState.close() }
-                            showAboutDialog = true
-                        },
+                        onAboutClick = null,
                         showFonts = false,
                         showAiSettings = false,
-                        showSupportProject = true
+                        showSupportProject = false
                     )
+                    }
                 }
             }
         ) {

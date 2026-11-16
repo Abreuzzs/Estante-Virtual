@@ -1,6 +1,7 @@
 package com.aryan.reader
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -51,10 +52,13 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -94,6 +98,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.aryan.reader.data.RecentFileItem
 import kotlin.math.abs
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private val ShelfSidePadding = 14.dp
 private val SlotGap = 1.dp
@@ -527,7 +533,7 @@ private fun ShelfRow(
             verticalAlignment = Alignment.Bottom,
         ) {
             var cursor = 0f
-            row.forEach { slot ->
+            row.forEachIndexed { slotIndex, slot ->
                 // Where this book sits relative to the vanishing point (shelf centre): books left of
                 // centre show their right edge, books right of centre show their left edge.
                 val centre = (cursor + slot.width / 2f) / rowWidth.value.coerceAtLeast(1f)
@@ -535,6 +541,7 @@ private fun ShelfRow(
                 cursor += slot.width + SlotGap.value
                 ShelfBook(
                     slot = slot,
+                    entranceIndex = slotIndex,
                     sideFactor = sideFactor,
                     selected = slot.item.bookId in selectedBookIds,
                     picked = organizing && slot.item.bookId == pickedId,
@@ -554,6 +561,7 @@ private fun ShelfRow(
 @Composable
 private fun ShelfBook(
     slot: ShelfSlot,
+    entranceIndex: Int,
     sideFactor: Float,
     selected: Boolean,
     picked: Boolean,
@@ -567,7 +575,32 @@ private fun ShelfBook(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val density = LocalDensity.current
-    val lifted = pressed || picked
+    val scope = rememberCoroutineScope()
+    var opening by remember { mutableStateOf(false) }
+    // Books settle onto the shelf the first time they appear (staggered), never again while scrolling.
+    val entering = remember(item.bookId) { BookshelfEntrance.shouldAnimate(item.bookId) }
+    val entrance = remember(item.bookId) { Animatable(if (entering) 0f else 1f) }
+    LaunchedEffect(item.bookId) {
+        if (entering) {
+            delay((entranceIndex * 28L).coerceAtMost(420L))
+            entrance.animateTo(1f, spring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessLow))
+        }
+    }
+    val handleClick: () -> Unit = {
+        if (organizing) {
+            onClick()
+        } else if (!opening) {
+            // The book slides out of the shelf for a moment, then the reader opens.
+            opening = true
+            scope.launch {
+                delay(150)
+                onClick()
+                delay(400)
+                opening = false
+            }
+        }
+    }
+    val lifted = pressed || picked || opening
     // Pulling a book off the shelf: a soft spring lift + scale, no layout change (cheap).
     val lift by animateFloatAsState(
         targetValue = if (lifted) 1f else 0f,
@@ -578,7 +611,7 @@ private fun ShelfBook(
     val sideDepth = if (slot.asCover) MaxSideDepth * abs(sideFactor) else 0.dp
     val shape = if (slot.asCover) RoundedCornerShape(topStart = 2.dp, topEnd = 3.dp, bottomEnd = 1.dp, bottomStart = 1.dp)
     else RoundedCornerShape(topStart = 2.dp, topEnd = 2.dp)
-    val needsLayer = lift > 0.001f || !item.isAvailable
+    val needsLayer = lift > 0.001f || !item.isAvailable || entrance.value < 1f
 
     Box(
         modifier = Modifier
@@ -591,13 +624,13 @@ private fun ShelfBook(
                         val dp = density.density
                         cameraDistance = 14f * dp
                         transformOrigin = TransformOrigin(0.5f, 1f)
-                        translationY = -10f * dp * lift
+                        translationY = -10f * dp * lift + (1f - entrance.value) * 28f * dp
                         val scale = 1f + 0.07f * lift
                         scaleX = scale
                         scaleY = scale
                         // A little yaw while lifted sells the "pulled out" depth without any 3D engine.
                         rotationY = -sideFactor * 10f * lift
-                        alpha = if (item.isAvailable) 1f else 0.55f
+                        alpha = (if (item.isAvailable) 1f else 0.55f) * entrance.value
                     }
                 } else Modifier,
             )
@@ -645,7 +678,7 @@ private fun ShelfBook(
             .combinedClickable(
                 interactionSource = interaction,
                 indication = null,
-                onClick = onClick,
+                onClick = handleClick,
                 onLongClick = onLongClick,
             )
             .testTag("BookshelfBook"),
@@ -722,7 +755,31 @@ private fun CoverFace(item: RecentFileItem, slot: ShelfSlot) {
                     ),
                 ),
         )
+        // The block of pages along the fore-edge, with faint page lines, makes the cover read as a real book.
+        Box(
+            Modifier
+                .align(Alignment.CenterEnd)
+                .fillMaxHeight()
+                .width(4.dp)
+                .drawBehind {
+                    drawRect(
+                        Brush.horizontalGradient(listOf(Color(0xFFD9D0BA), Color(0xFFF4EEDF), Color(0xFFCFC5AC))),
+                    )
+                    val step = 2.5.dp.toPx()
+                    var y = step
+                    while (y < size.height) {
+                        drawLine(Color.Black.copy(alpha = 0.08f), Offset(0f, y), Offset(size.width, y), 0.5.dp.toPx())
+                        y += step
+                    }
+                },
+        )
     }
+}
+
+/** Remembers which books already played their entrance animation during this app session. */
+private object BookshelfEntrance {
+    private val seen = HashSet<String>()
+    fun shouldAnimate(bookId: String): Boolean = seen.add(bookId)
 }
 
 @Composable
@@ -954,6 +1011,29 @@ private fun BookshelfCustomizeSheet(
                     },
                 )
             }
+        }
+        val sheetContext = LocalContext.current
+        var onlineCovers by remember { mutableStateOf(BookCoverEnrichmentWorker.isEnabled(sheetContext)) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.bookshelf_online_covers), style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    stringResource(R.string.bookshelf_online_covers_desc),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = onlineCovers,
+                onCheckedChange = {
+                    onlineCovers = it
+                    BookCoverEnrichmentWorker.setEnabled(sheetContext, it)
+                },
+            )
         }
         if (hasManualOrder) {
             TextButton(onClick = onResetOrder) {
